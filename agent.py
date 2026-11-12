@@ -40,6 +40,7 @@ class Analysis:
     ink_polarity: str
     threshold_method: str
     stroke_width_px: float
+    stroke_width_mode: str
     mode_used: str
 
 
