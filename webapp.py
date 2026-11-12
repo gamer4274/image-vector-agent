@@ -109,6 +109,10 @@ FORM_BODY = """<div class="card">
       <input type="checkbox" name="close" value="1" style="width:auto" checked>
       Tracés fermés (gravure / découpe laser)
     </label>
+    <label style="font-weight:400">
+      <input type="checkbox" name="curves" value="1" style="width:auto" checked>
+      Cercles et arcs parfaits (CAO)
+    </label>
     <div class="row">
       <div>
         <label for="stroke_width">Épaisseur du trait SVG (px)</label>
@@ -127,7 +131,7 @@ RESULT_BODY = """<div class="card">
   <h1>Résultat de la conversion</h1>
   <p><strong>{{ report.source }}</strong> — {{ report.analysis.width }}×{{ report.analysis.height }} px,
      mode {{ report.analysis.mode_used }}, seuillage {{ report.analysis.threshold_method }},
-     {{ report.paths }} tracés (dont {{ report.closed_paths }} fermés), {{ report.points }} points.</p>
+     {{ report.paths }} tracés (dont {{ report.closed_paths }} fermés, {{ report.circles }} cercles et {{ report.arcs }} arcs parfaits), {{ report.points }} points.</p>
   <img class="preview" src="{{ url_for('download', job_id=job_id, filename=preview_name) }}" alt="Aperçu du tracé">
   <table>
     <tr><th>Contraste (écart-type)</th><td>{{ report.analysis.contrast_std }}</td></tr>
@@ -198,6 +202,7 @@ def convert():
         close_lines=close_lines,
         closed_only=False,
         stroke_width=stroke_width,
+        fit_curves=request.form.get("curves") == "1",
     )
     try:
         report = agent.run(src, job_dir)

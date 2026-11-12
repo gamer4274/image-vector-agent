@@ -48,6 +48,11 @@ class Analysis:
 class VectorPath:
     points: list
     closed: bool
+    kind: str = "poly"
+    center: tuple | None = None
+    radius: float = 0.0
+    start_angle: float = 0.0
+    sweep: float = 0.0
 
 
 def load_image(path: Path) -> np.ndarray:
@@ -245,6 +250,17 @@ def write_svg(paths: list[VectorPath], width: int, height: int, stroke_width: fl
         f'  <g fill="none" stroke="#000000" stroke-width="{w:.2f}" stroke-linecap="round" stroke-linejoin="round">',
     ]
     for p in paths:
+        if p.kind == "circle":
+            cx, cy = p.center
+            lines.append(f'    <circle cx="{cx:.2f}" cy="{cy:.2f}" r="{p.radius:.2f}"/>')
+            continue
+        if p.kind == "arc":
+            pts = curve_points(p)
+            (sx, sy), (ex, ey) = pts[0], pts[-1]
+            large = 1 if abs(p.sweep) > 180 else 0
+            sweep_flag = 1 if p.sweep > 0 else 0
+            lines.append(f'    <path d="M {sx:.2f} {sy:.2f} A {p.radius:.2f} {p.radius:.2f} 0 {large} {sweep_flag} {ex:.2f} {ey:.2f}"/>')
+            continue
         d = f"M {p.points[0][0]} {p.points[0][1]}"
         for x, y in p.points[1:]:
             d += f" L {x} {y}"
@@ -264,6 +280,20 @@ def write_dxf(paths: list[VectorPath], height: int, unit: str, user_scale: float
     msp = doc.modelspace()
     k = user_scale
     for p in paths:
+        if p.kind == "circle":
+            cx, cy = p.center
+            msp.add_circle((cx * k, (height - cy) * k), p.radius * k, dxfattribs={"layer": "TRACE"})
+            continue
+        if p.kind == "arc":
+            cx, cy = p.center
+            a0 = (-p.start_angle) % 360.0
+            sweep_d = -p.sweep
+            if sweep_d >= 0:
+                start, end = a0, (a0 + sweep_d) % 360.0
+            else:
+                start, end = (a0 + sweep_d) % 360.0, a0
+            msp.add_arc((cx * k, (height - cy) * k), p.radius * k, start, end, dxfattribs={"layer": "TRACE"})
+            continue
         pts = [(x * k, (height - y) * k) for x, y in p.points]
         msp.add_lwpolyline(pts, format="xy", close=p.closed, dxfattribs={"layer": "TRACE"})
     doc.saveas(out)
@@ -272,14 +302,71 @@ def write_dxf(paths: list[VectorPath], height: int, unit: str, user_scale: float
 def write_preview(paths: list[VectorPath], width: int, height: int, out: Path) -> None:
     canvas = np.full((height, width, 3), 255, dtype=np.uint8)
     for p in paths:
-        pts = np.array([[int(round(x)), int(round(y))] for x, y in p.points], dtype=np.int32)
-        cv2.polylines(canvas, [pts], p.closed, (0, 0, 0), 1, cv2.LINE_AA)
+        pts = np.array([[int(round(x)), int(round(y))] for x, y in curve_points(p)], dtype=np.int32)
+        cv2.polylines(canvas, [pts], p.closed or p.kind == "circle", (0, 0, 0), 1, cv2.LINE_AA)
     cv2.imwrite(str(out), canvas)
 
 
+def circle_fit(pts: np.ndarray):
+    x, y = pts[:, 0], pts[:, 1]
+    Amat = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
+    bvec = x ** 2 + y ** 2
+    sol, *_ = np.linalg.lstsq(Amat, bvec, rcond=None)
+    cx, cy, c = sol
+    r2 = c + cx * cx + cy * cy
+    if r2 <= 0:
+        return None
+    r = math.sqrt(r2)
+    err = np.abs(np.hypot(x - cx, y - cy) - r)
+    return float(cx), float(cy), r, float(err.max())
+
+
+def detect_curves(paths: list[VectorPath], tol: float, max_dim: float) -> list[VectorPath]:
+    result = []
+    for p in paths:
+        if p.kind != "poly" or len(p.points) < 8:
+            result.append(p)
+            continue
+        pts = np.array(p.points, dtype=np.float64)
+        fit = circle_fit(pts)
+        if fit is None:
+            result.append(p)
+            continue
+        cx, cy, r, emax = fit
+        if r < 4.0 or r > 2.0 * max_dim or emax > max(1.5 * tol, 0.03 * r):
+            result.append(p)
+            continue
+        ang = np.degrees(np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx))
+        unwrapped = np.unwrap(np.radians(ang))
+        sweep = float(np.degrees(unwrapped[-1] - unwrapped[0]))
+        if float(np.abs(np.diff(unwrapped)).max()) > math.radians(45.0):
+            result.append(p)
+            continue
+        if abs(sweep) >= 320.0:
+            result.append(VectorPath(points=[], closed=True, kind="circle", center=(cx, cy), radius=r))
+        elif 25.0 <= abs(sweep) <= 330.0:
+            result.append(VectorPath(points=[], closed=False, kind="arc", center=(cx, cy), radius=r,
+                                     start_angle=float(ang[0]) % 360.0, sweep=sweep))
+        else:
+            result.append(p)
+    return result
+
+
+def curve_points(p: VectorPath, step_deg: float = 5.0) -> list:
+    if p.kind == "circle":
+        n = max(24, int(360 / step_deg))
+        return [(p.center[0] + p.radius * math.cos(math.radians(360 * i / n)),
+                 p.center[1] + p.radius * math.sin(math.radians(360 * i / n))) for i in range(n)]
+    if p.kind == "arc":
+        n = max(4, int(abs(p.sweep) / step_deg))
+        return [(p.center[0] + p.radius * math.cos(math.radians(p.start_angle + p.sweep * i / n)),
+                 p.center[1] + p.radius * math.sin(math.radians(p.start_angle + p.sweep * i / n))) for i in range(n + 1)]
+    return p.points
+
+
 def close_paths(paths: list[VectorPath], gap: float, closed_only: bool) -> list[VectorPath]:
-    result = [p for p in paths if p.closed]
-    opens = [p for p in paths if not p.closed]
+    result = [p for p in paths if p.closed or p.kind != "poly"]
+    opens = [p for p in paths if not p.closed and p.kind == "poly"]
     if not opens:
         return result
 
@@ -419,7 +506,8 @@ class ImageVectorAgent:
     def __init__(self, mode: str = "auto", quality: str = "high", tolerance: float | None = None,
                  threshold: str = "auto", invert: bool = False, unit: str = "px", scale: float = 1.0,
                  min_area_frac: float = 2e-5, close_lines: bool = False, closed_only: bool = False,
-                 gap: float | None = None, stroke_width: float | None = None):
+                 gap: float | None = None, stroke_width: float | None = None,
+                 fit_curves: bool = True):
         self.mode = mode
         self.quality = quality
         self.tolerance = tolerance
@@ -432,6 +520,7 @@ class ImageVectorAgent:
         self.closed_only = closed_only
         self.gap = gap
         self.stroke_width = stroke_width
+        self.fit_curves = fit_curves
 
     def run(self, src: Path, outdir: Path) -> dict:
         outdir.mkdir(parents=True, exist_ok=True)
@@ -483,6 +572,10 @@ class ImageVectorAgent:
             gap = self.gap if self.gap is not None else max(1.5, 0.004 * max(w0, h0))
             paths = close_paths(paths, gap, self.closed_only)
             closed_count = sum(1 for p in paths if p.closed)
+        if self.fit_curves:
+            paths = detect_curves(paths, tol / scale, max(w0, h0))
+        n_circles = sum(1 for p in paths if p.kind == "circle")
+        n_arcs = sum(1 for p in paths if p.kind == "arc")
 
         stroke_out = self.stroke_width if self.stroke_width is not None else stroke_up / scale
 
@@ -514,6 +607,8 @@ class ImageVectorAgent:
                            "close_lines": self.close_lines, "closed_only": self.closed_only, "gap_px": self.gap},
             "paths": len(paths),
             "closed_paths": closed_count,
+            "circles": n_circles,
+            "arcs": n_arcs,
             "points": sum(len(p.points) for p in paths),
             "outputs": {"svg": str(svg_path), "dxf": str(dxf_path), "preview": str(preview_path),
                          "report": str(outdir / (src.stem + "_report.json"))},
@@ -538,12 +633,14 @@ def main(argv=None) -> int:
     ap.add_argument("--closed-only", action="store_true", help="Ne conserver que les tracés fermés")
     ap.add_argument("--gap", type=float, default=None, help="Distance max de raccord des extrémités en px (défaut auto)")
     ap.add_argument("--stroke-width", type=float, default=None, help="Épaisseur du trait SVG en px (défaut : estimation auto)")
+    ap.add_argument("--no-curves", action="store_true", help="Désactiver la détection de cercles/arcs parfaits")
     args = ap.parse_args(argv)
 
     agent = ImageVectorAgent(mode=args.mode, quality=args.quality, tolerance=args.tolerance,
                              threshold=args.threshold, invert=args.invert, unit=args.unit, scale=args.scale,
                              min_area_frac=args.min_area, close_lines=args.close,
-                             closed_only=args.closed_only, gap=args.gap, stroke_width=args.stroke_width)
+                             closed_only=args.closed_only, gap=args.gap, stroke_width=args.stroke_width,
+                             fit_curves=not args.no_curves)
     try:
         report = agent.run(args.image, args.outdir)
     except (ValueError, FileNotFoundError) as e:

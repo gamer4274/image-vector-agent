@@ -18,7 +18,8 @@ Convertit une image JPEG (scan de plan, dessin technique, schéma, logo) en fich
    - mode `edges` : détection d'arêtes (Canny) puis tracé central — capture tous les détails internes d'une image tonale (cercles, engrenages, visages) ;
    - mode `auto` : choisit selon la densité d'encre, détecte un fond sombre (polarité inversée automatique) et bascule vers `edges` si le tracé central est trop bruité.
 5. **Simplification** : Douglas-Peucker avec tolérance sub-pixel (préréglage `high` = 0,8 px) pour un fichier léger mais fidèle.
-6. **Export** SVG + DXF + aperçu + rapport.
+6. **Cercles et arcs parfaits (CAO)** : chaque tracé dont les points s'ajustent à une géométrie circulaire (erreur radiale faible, couverture angulaire continue) devient une entité exacte — `CIRCLE`/`ARC` dans le DXF, `<circle>`/arc SVG — avec une précision typique de l'ordre du dixième de pixel. Désactivable avec `--no-curves`.
+7. **Export** SVG + DXF + aperçu + rapport.
 
 ## Usage
 
@@ -60,6 +61,7 @@ python agent.py plan.jpg -o sortie/ --threshold adaptive --min-area 1e-5
 | `--closed-only` | flag | Ne conserve que les tracés fermés |
 | `--gap` | float | Distance max de raccord des extrémités en px (défaut auto : max(1,5 px ; 0,4 % de la taille)) |
 | `--stroke-width` | float | Épaisseur du trait SVG en px (défaut : estimation automatique) |
+| `--no-curves` | flag | Désactive la détection de cercles/arcs parfaits |
 
 ## Gravure laser
 
