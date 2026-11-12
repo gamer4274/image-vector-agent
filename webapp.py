@@ -109,6 +109,16 @@ FORM_BODY = """<div class="card">
       <input type="checkbox" name="close" value="1" style="width:auto" checked>
       Tracés fermés (gravure / découpe laser)
     </label>
+    <div class="row">
+      <div>
+        <label for="stroke_width">Épaisseur du trait SVG (px)</label>
+        <input type="text" id="stroke_width" name="stroke_width" value="1" inputmode="decimal">
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <span style="font-size:.8rem;color:#666">Laisser « auto » pour l'épaisseur estimée</span>
+      </div>
+    </div>
     <button type="submit">Convertir</button>
   </form>
 </div>"""
@@ -170,6 +180,15 @@ def convert():
         scale = 1.0
 
     close_lines = request.form.get("close") == "1"
+    raw_stroke = request.form.get("stroke_width", "").strip().lower()
+    stroke_width = None
+    if raw_stroke and raw_stroke != "auto":
+        try:
+            stroke_width = float(raw_stroke.replace(",", "."))
+            if stroke_width <= 0:
+                raise ValueError
+        except ValueError:
+            stroke_width = None
     agent = ImageVectorAgent(
         mode=request.form.get("mode", "auto"),
         quality=request.form.get("quality", "high"),
@@ -178,6 +197,7 @@ def convert():
         invert=request.form.get("invert") == "1",
         close_lines=close_lines,
         closed_only=False,
+        stroke_width=stroke_width,
     )
     try:
         report = agent.run(src, job_dir)

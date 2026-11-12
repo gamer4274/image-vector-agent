@@ -40,6 +40,7 @@ class Analysis:
     ink_polarity: str
     threshold_method: str
     stroke_width_px: float
+    stroke_width_mode: str
     mode_used: str
 
 
@@ -418,7 +419,7 @@ class ImageVectorAgent:
     def __init__(self, mode: str = "auto", quality: str = "high", tolerance: float | None = None,
                  threshold: str = "auto", invert: bool = False, unit: str = "px", scale: float = 1.0,
                  min_area_frac: float = 2e-5, close_lines: bool = False, closed_only: bool = False,
-                 gap: float | None = None):
+                 gap: float | None = None, stroke_width: float | None = None):
         self.mode = mode
         self.quality = quality
         self.tolerance = tolerance
@@ -430,6 +431,7 @@ class ImageVectorAgent:
         self.close_lines = close_lines
         self.closed_only = closed_only
         self.gap = gap
+        self.stroke_width = stroke_width
 
     def run(self, src: Path, outdir: Path) -> dict:
         outdir.mkdir(parents=True, exist_ok=True)
@@ -482,7 +484,7 @@ class ImageVectorAgent:
             paths = close_paths(paths, gap, self.closed_only)
             closed_count = sum(1 for p in paths if p.closed)
 
-        stroke_out = stroke_up / scale
+        stroke_out = self.stroke_width if self.stroke_width is not None else stroke_up / scale
 
         svg_path = outdir / (src.stem + ".svg")
         dxf_path = outdir / (src.stem + ".dxf")
@@ -500,6 +502,7 @@ class ImageVectorAgent:
             ink_polarity=polarity,
             threshold_method=tmethod,
             stroke_width_px=round(stroke_out, 2),
+            stroke_width_mode="manuel" if self.stroke_width is not None else "auto",
             mode_used=mode,
         )
         report = {
@@ -534,12 +537,13 @@ def main(argv=None) -> int:
     ap.add_argument("--close", action="store_true", help="Fermer les tracés : raccord des extrémités proches (gravure laser)")
     ap.add_argument("--closed-only", action="store_true", help="Ne conserver que les tracés fermés")
     ap.add_argument("--gap", type=float, default=None, help="Distance max de raccord des extrémités en px (défaut auto)")
+    ap.add_argument("--stroke-width", type=float, default=None, help="Épaisseur du trait SVG en px (défaut : estimation auto)")
     args = ap.parse_args(argv)
 
     agent = ImageVectorAgent(mode=args.mode, quality=args.quality, tolerance=args.tolerance,
                              threshold=args.threshold, invert=args.invert, unit=args.unit, scale=args.scale,
                              min_area_frac=args.min_area, close_lines=args.close,
-                             closed_only=args.closed_only, gap=args.gap)
+                             closed_only=args.closed_only, gap=args.gap, stroke_width=args.stroke_width)
     try:
         report = agent.run(args.image, args.outdir)
     except (ValueError, FileNotFoundError) as e:
