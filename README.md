@@ -19,7 +19,8 @@ Convertit une image JPEG (scan de plan, dessin technique, schéma, logo) en fich
    - mode `auto` : choisit selon la densité d'encre, détecte un fond sombre (polarité inversée automatique) et bascule vers `edges` si le tracé central est trop bruité.
 5. **Simplification** : Douglas-Peucker avec tolérance sub-pixel (préréglage `high` = 0,8 px) pour un fichier léger mais fidèle.
 6. **Cercles et arcs parfaits (CAO)** : chaque tracé dont les points s'ajustent à une géométrie circulaire (erreur radiale faible, couverture angulaire continue) devient une entité exacte — `CIRCLE`/`ARC` dans le DXF, `<circle>`/arc SVG — avec une précision typique de l'ordre du dixième de pixel. Désactivable avec `--no-curves`.
-7. **Export** SVG + DXF + aperçu + rapport.
+7. **Anneaux concentriques (détection dédiée)** : les grands cercles réguliers d'une photo (cadre d'un médaillon, bord d'une pièce, roue) ne suivent pas toujours les tracés extraits. Un second passage analyse le profil radial des arêtes autour du centre dominant de l'image : tout anneau fin, isolé et suffisamment contrasté est ajouté comme `CIRCLE` exact (les cercles déjà détectés ne sont pas doublés, et les faux positifs — bord de photo, textures — sont rejetés par des tests de contraste et d'isolement radial).
+8. **Export** SVG + DXF + aperçu + rapport.
 
 ## Usage
 
