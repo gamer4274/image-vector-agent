@@ -74,6 +74,7 @@ FORM_BODY = """<div class="card">
           <option value="auto" selected>Automatique</option>
           <option value="centerline">Tracé central (plans, dessins au trait)</option>
           <option value="outline">Contours (logos, formes pleines)</option>
+          <option value="edges">Détails internes (logos détaillés, photos)</option>
         </select>
       </div>
       <div>

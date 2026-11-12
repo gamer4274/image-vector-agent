@@ -206,6 +206,17 @@ def prune_and_simplify(paths: list, tolerance: float, scale: float) -> list[Vect
     return result
 
 
+def extract_edges(gray: np.ndarray, tolerance: float, scale: float) -> list[VectorPath]:
+    smooth = cv2.bilateralFilter(gray, 7, 40, 40)
+    med = float(np.median(smooth))
+    lo = int(max(15.0, min(150.0, med * 0.60)))
+    hi = int(max(45.0, min(230.0, med * 1.20)))
+    edges = cv2.Canny(smooth, lo, hi)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+    skel = skeletonize(edges > 0).astype(np.uint8) * 255
+    return prune_and_simplify(trace_skeleton(skel), tolerance, scale)
+
+
 def extract_outlines(mask: np.ndarray, tolerance: float, scale: float) -> list[VectorPath]:
     contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     h, w = mask.shape
@@ -314,8 +325,10 @@ class ImageVectorAgent:
             skel = skeletonize(mask > 0).astype(np.uint8) * 255
             paths = prune_and_simplify(trace_skeleton(skel), tol, scale)
             if len(paths) > 1.5 * max(w0, h0):
-                mode = "outline"
-                paths = extract_outlines(mask, tol, scale)
+                mode = "edges"
+                paths = extract_edges(gray, tol, scale)
+        elif mode == "edges":
+            paths = extract_edges(gray, tol, scale)
         else:
             paths = extract_outlines(mask, tol, scale)
 
@@ -358,7 +371,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Agent analyste d'image : JPEG -> SVG + DXF")
     ap.add_argument("image", type=Path)
     ap.add_argument("-o", "--outdir", type=Path, default=Path("sortie"))
-    ap.add_argument("--mode", choices=["auto", "centerline", "outline"], default="auto")
+    ap.add_argument("--mode", choices=["auto", "centerline", "outline", "edges"], default="auto")
     ap.add_argument("--quality", choices=["max", "high", "balanced"], default="high")
     ap.add_argument("--tolerance", type=float, default=None, help="Écart max de simplification en px image")
     ap.add_argument("--threshold", choices=["auto", "otsu", "adaptive"], default="auto")
