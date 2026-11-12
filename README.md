@@ -19,7 +19,8 @@ Convertit une image JPEG (scan de plan, dessin technique, schéma, logo) en fich
    - mode `auto` : choisit selon la densité d'encre, détecte un fond sombre (polarité inversée automatique) et bascule vers `edges` si le tracé central est trop bruité.
 5. **Simplification** : Douglas-Peucker avec tolérance sub-pixel (préréglage `high` = 0,8 px) pour un fichier léger mais fidèle.
 6. **Cercles et arcs parfaits (CAO)** : chaque tracé dont les points s'ajustent à une géométrie circulaire (erreur radiale faible, couverture angulaire continue) devient une entité exacte — `CIRCLE`/`ARC` dans le DXF, `<circle>`/arc SVG — avec une précision typique de l'ordre du dixième de pixel. Désactivable avec `--no-curves`.
-7. **Export** SVG + DXF + aperçu + rapport.
+7. **Anneaux concentriques (détection dédiée)** : les grands cercles réguliers d'une photo (cadre d'un médaillon, bord d'une pièce, roue) ne suivent pas toujours les tracés extraits. Un second passage combine un balayage radial autour des principaux centres de l'image (anneaux concentriques, y compris à double piste et multi-centres) et une transformée de Hough (petits cercles, multi-centres, sans plafond arbitraire). Chaque candidat est affiné puis validé par des tests de couverture d'arêtes, d'isolement radial (proéminence), de contraste et de **dispersion radiale** — ce dernier rejette les faux positifs circiformes (lettres « O » et glyphes de texte). Limites connues sur photos très texturées : les petits cercles noyés dans la texture (rivets) et les cercles internes des engrenages à double piste serrée peuvent ne pas être promus en entités `CIRCLE` exactes ; ils restent alors dans le tracé général (polylignes).
+8. **Export** SVG + DXF + aperçu + rapport.
 
 ## Usage
 
@@ -83,3 +84,11 @@ Dans l'interface web, la case « Tracés fermés (gravure / découpe laser) » a
 - Le mode `centerline` produit un trait unique par trait de crayon (pas de double contour).
 - `--quality max` réduit la simplification au minimum (0,45 px) au prix de plus de points.
 - L'épaisseur de trait SVG est estimée automatiquement depuis la transformée de distance du masque, ou fixée manuellement avec `--stroke-width` (ex. `--stroke-width 1` pour un trait fin).
+
+## Tests
+
+```bash
+python -m unittest test_agent -v
+```
+
+Couvre : ajustement de cercles, scores d'anneaux, détection de cercles parfaits (complets, occultés, concentriques à double piste, petits cercles), rejet des faux positifs (ellipses, glyphes de texte), borne de temps de `detect_rings`, détection d'arcs, fermeture de tracés (gravure laser), exports SVG/DXF (`CIRCLE`/`ARC`/`LWPOLYLINE`) et un test bout-en-bout du pipeline.
