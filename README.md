@@ -59,6 +59,7 @@ python agent.py plan.jpg -o sortie/ --threshold adaptive --min-area 1e-5
 | `--close` | flag | Ferme les tracés : raccorde les extrémités proches en boucles (gravure/découpe laser) |
 | `--closed-only` | flag | Ne conserve que les tracés fermés |
 | `--gap` | float | Distance max de raccord des extrémités en px (défaut auto : max(1,5 px ; 0,4 % de la taille)) |
+| `--stroke-width` | float | Épaisseur du trait SVG en px (défaut : estimation automatique) |
 
 ## Gravure laser
 
@@ -79,4 +80,4 @@ Dans l'interface web, la case « Tracés fermés (gravure / découpe laser) » a
 - Le SVG conserve les dimensions exactes de l'image (`viewBox` = taille d'origine).
 - Le mode `centerline` produit un trait unique par trait de crayon (pas de double contour).
 - `--quality max` réduit la simplification au minimum (0,45 px) au prix de plus de points.
-- L'épaisseur de trait SVG est estimée automatiquement depuis la transformée de distance du masque.
+- L'épaisseur de trait SVG est estimée automatiquement depuis la transformée de distance du masque, ou fixée manuellement avec `--stroke-width` (ex. `--stroke-width 1` pour un trait fin).
