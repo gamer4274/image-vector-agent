@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -19,6 +20,7 @@ from skimage.measure import approximate_polygon
 from skimage.morphology import skeletonize
 
 import ezdxf
+from scipy.spatial import cKDTree
 
 QUALITY_TOLERANCE = {"max": 0.45, "high": 0.8, "balanced": 1.6}
 TARGET_MIN_SIDE = 1600
@@ -274,10 +276,97 @@ def write_preview(paths: list[VectorPath], width: int, height: int, out: Path) -
     cv2.imwrite(str(out), canvas)
 
 
+def close_paths(paths: list[VectorPath], gap: float, closed_only: bool) -> list[VectorPath]:
+    result = [p for p in paths if p.closed]
+    opens = [p for p in paths if not p.closed]
+    if not opens:
+        return result
+
+    ends = []
+    for i, p in enumerate(opens):
+        ends.append((i, 0, p.points[0]))
+        ends.append((i, 1, p.points[-1]))
+    coords = np.array([[e[2][0], e[2][1]] for e in ends])
+    tree = cKDTree(coords)
+    raw_pairs = tree.query_pairs(gap, output_type="ndarray")
+
+    degree = np.zeros(len(ends), dtype=int)
+    candidates = []
+    for a, b in raw_pairs:
+        a, b = int(a), int(b)
+        if ends[a][0] == ends[b][0]:
+            continue
+        candidates.append((float(np.hypot(*(coords[a] - coords[b]))), a, b))
+        degree[a] += 1
+        degree[b] += 1
+    candidates.sort()
+
+    phase1 = [c for c in candidates if degree[c[1]] == 1 and degree[c[2]] == 1]
+    phase2 = [c for c in candidates if not (degree[c[1]] == 1 and degree[c[2]] == 1)]
+
+    def opposite_distance(a, b):
+        pa, wa = ends[a][0], ends[a][1]
+        pb, wb = ends[b][0], ends[b][1]
+        oa, ob = 2 * pa + (1 - wa), 2 * pb + (1 - wb)
+        return float(np.hypot(*(coords[oa] - coords[ob])))
+
+    phase2.sort(key=lambda c: (-opposite_distance(c[1], c[2]), c[0]))
+
+    chains = {}
+    for i, p in enumerate(opens):
+        chains[i] = {"pts": list(p.points), "e_start": (i, 0), "e_end": (i, 1), "closed": False}
+    end_chain = {}
+    for i in chains:
+        end_chain[(i, 0)] = i
+        end_chain[(i, 1)] = i
+
+    def oriented(chain, end_id):
+        if chain["e_start"] == end_id:
+            return chain["pts"], chain["e_end"]
+        return chain["pts"][::-1], chain["e_start"]
+
+    for _, a, b in phase1 + phase2:
+        ca = end_chain.get((ends[a][0], ends[a][1]))
+        cb = end_chain.get((ends[b][0], ends[b][1]))
+        if ca is None or cb is None or ca == cb:
+            continue
+        A, B = chains[ca], chains[cb]
+        if A["closed"] or B["closed"]:
+            continue
+        end_a = (ends[a][0], ends[a][1])
+        end_b = (ends[b][0], ends[b][1])
+        pa, other_a = oriented(A, end_a)
+        pb, other_b = oriented(B, end_b)
+        merged = {"pts": pa + pb, "e_start": other_a, "e_end": other_b, "closed": False}
+        if other_a == other_b:
+            merged["pts"].append(merged["pts"][0])
+            merged["closed"] = True
+            merged["e_start"] = merged["e_end"] = None
+        del chains[ca], chains[cb]
+        end_chain.pop(end_a, None)
+        end_chain.pop(end_b, None)
+        new_id = max(chains, default=-1) + 1
+        chains[new_id] = merged
+        if merged["e_start"] is not None:
+            end_chain[merged["e_start"]] = new_id
+            end_chain[merged["e_end"]] = new_id
+
+    for c in chains.values():
+        if not c["closed"]:
+            d = math.dist(c["pts"][0], c["pts"][-1])
+            if d <= gap * 2.5:
+                c["pts"].append(c["pts"][0])
+                c["closed"] = True
+        if c["closed"] or not closed_only:
+            result.append(VectorPath(points=c["pts"], closed=c["closed"]))
+    return result
+
+
 class ImageVectorAgent:
     def __init__(self, mode: str = "auto", quality: str = "high", tolerance: float | None = None,
                  threshold: str = "auto", invert: bool = False, unit: str = "px", scale: float = 1.0,
-                 min_area_frac: float = 2e-5):
+                 min_area_frac: float = 2e-5, close_lines: bool = False, closed_only: bool = False,
+                 gap: float | None = None):
         self.mode = mode
         self.quality = quality
         self.tolerance = tolerance
@@ -286,6 +375,9 @@ class ImageVectorAgent:
         self.unit = unit
         self.scale = scale
         self.min_area_frac = min_area_frac
+        self.close_lines = close_lines
+        self.closed_only = closed_only
+        self.gap = gap
 
     def run(self, src: Path, outdir: Path) -> dict:
         outdir.mkdir(parents=True, exist_ok=True)
@@ -332,6 +424,12 @@ class ImageVectorAgent:
         else:
             paths = extract_outlines(mask, tol, scale)
 
+        closed_count = sum(1 for p in paths if p.closed)
+        if self.close_lines:
+            gap = self.gap if self.gap is not None else max(1.5, 0.004 * max(w0, h0))
+            paths = close_paths(paths, gap, self.closed_only)
+            closed_count = sum(1 for p in paths if p.closed)
+
         stroke_out = stroke_up / scale
 
         svg_path = outdir / (src.stem + ".svg")
@@ -357,8 +455,10 @@ class ImageVectorAgent:
             "analysis": asdict(analysis),
             "parameters": {"mode": self.mode, "mode_effectif": mode, "quality": self.quality,
                            "tolerance_px": round(tol / scale, 3),
-                           "threshold": self.threshold, "invert": invert, "unit": self.unit, "scale": self.scale},
+                           "threshold": self.threshold, "invert": invert, "unit": self.unit, "scale": self.scale,
+                           "close_lines": self.close_lines, "closed_only": self.closed_only, "gap_px": self.gap},
             "paths": len(paths),
+            "closed_paths": closed_count,
             "points": sum(len(p.points) for p in paths),
             "outputs": {"svg": str(svg_path), "dxf": str(dxf_path), "preview": str(preview_path),
                          "report": str(outdir / (src.stem + "_report.json"))},
@@ -379,11 +479,15 @@ def main(argv=None) -> int:
     ap.add_argument("--unit", choices=["px", "mm", "cm", "in"], default="px")
     ap.add_argument("--scale", type=float, default=1.0, help="Facteur d'échelle des coordonnées DXF")
     ap.add_argument("--min-area", type=float, default=2e-5, help="Fraction de surface minimale des composantes gardées")
+    ap.add_argument("--close", action="store_true", help="Fermer les tracés : raccord des extrémités proches (gravure laser)")
+    ap.add_argument("--closed-only", action="store_true", help="Ne conserver que les tracés fermés")
+    ap.add_argument("--gap", type=float, default=None, help="Distance max de raccord des extrémités en px (défaut auto)")
     args = ap.parse_args(argv)
 
     agent = ImageVectorAgent(mode=args.mode, quality=args.quality, tolerance=args.tolerance,
                              threshold=args.threshold, invert=args.invert, unit=args.unit, scale=args.scale,
-                             min_area_frac=args.min_area)
+                             min_area_frac=args.min_area, close_lines=args.close,
+                             closed_only=args.closed_only, gap=args.gap)
     try:
         report = agent.run(args.image, args.outdir)
     except (ValueError, FileNotFoundError) as e:
