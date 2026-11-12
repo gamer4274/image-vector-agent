@@ -352,57 +352,201 @@ def detect_curves(paths: list[VectorPath], tol: float, max_dim: float) -> list[V
     return result
 
 
-def edge_coverage_map(gray: np.ndarray):
+def build_ring_maps(gray: np.ndarray):
+    """Cartes d'arêtes pour la détection d'anneaux.
+
+    - dist : distance de chaque pixel à l'arête (Canny seuils bas) la plus proche ;
+    - labels/ang/gmag : pour chaque pixel, l'arête la plus proche (identifiant),
+      l'orientation de son gradient et son amplitude ;
+    - gblur : luminance lissée pour mesurer le contraste de part et d'autre d'un cercle.
+    """
     smooth = cv2.GaussianBlur(gray, (5, 5), 1.2)
     edges = cv2.Canny(smooth, 10, 30)
-    dist = cv2.distanceTransform((edges == 0).astype(np.uint8), cv2.DIST_L2, 3)
+    dist, labels = cv2.distanceTransformWithLabels((edges == 0).astype(np.uint8), cv2.DIST_L2, 5,
+                                                   labelType=cv2.DIST_LABEL_PIXEL)
+    gx = cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3)
+    eys, exs = np.nonzero(edges)
+    lab_ids = labels[eys, exs]
+    ang = np.zeros(int(labels.max()) + 1, dtype=np.float32)
+    ang[lab_ids] = np.arctan2(gy[eys, exs], gx[eys, exs])
+    gmag = np.zeros(int(labels.max()) + 1, dtype=np.float32)
+    gmag[lab_ids] = np.hypot(gx[eys, exs], gy[eys, exs])
     gblur = cv2.GaussianBlur(gray, (9, 9), 2.0).astype(np.float32)
-    return dist, gblur
+    return dist, labels, ang, gmag, gblur
 
 
-def ring_scores(dist: np.ndarray, gblur: np.ndarray, cx: float, cy: float, r: float):
-    """Couverture d'arêtes, prominence radiale et contraste de luminance d'un cercle."""
+def ring_scores(maps, cx: float, cy: float, r: float):
+    """Vérification d'un cercle : couvertures (simple et cohérente), plus grand
+    secteur occlus, contraste de luminance. Coords image up-scalées."""
+    dist, labels, ang, gmag, gblur = maps
     H, W = dist.shape
     th = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
     ct, st = np.cos(th), np.sin(th)
-
-    def coverage(rr: float) -> float:
-        px = np.clip(np.round(cx + rr * ct).astype(int), 0, W - 1)
-        py = np.clip(np.round(cy + rr * st).astype(int), 0, H - 1)
-        return float((dist[py, px] <= 3.0).mean())
-
-    cov = coverage(r)
-    inner = min(coverage(r - d) for d in range(6, 26, 2))
-    outer = min(coverage(r + d) for d in range(6, 26, 2))
+    px = np.clip(np.round(cx + r * ct).astype(int), 0, W - 1)
+    py = np.clip(np.round(cy + r * st).astype(int), 0, H - 1)
+    near = dist[py, px] <= 3.0
+    ga = ang[labels[py, px]]
+    radial = np.arctan2(py - cy, px - cx)
+    d = np.abs((ga - radial + np.pi) % (2.0 * np.pi) - np.pi)
+    coh = near & (d < math.radians(45.0)) & (gmag[labels[py, px]] > 15.0)
+    idx = np.nonzero(~near)[0]
+    if len(idx) == 0:
+        gap = 0.0
+    else:
+        runs = np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1)
+        gap = max(len(x) for x in runs) / len(near)
+        if not near[0] and not near[-1]:
+            gap = max(gap, (len(runs[0]) + len(runs[-1])) / len(near))
     step = 0.0
-    for d in (3, 5, 8):
-        pi = np.clip(np.round(cx + (r - d) * ct).astype(int), 0, W - 1)
-        qi = np.clip(np.round(cy + (r - d) * st).astype(int), 0, H - 1)
-        po = np.clip(np.round(cx + (r + d) * ct).astype(int), 0, W - 1)
-        qo = np.clip(np.round(cy + (r + d) * st).astype(int), 0, H - 1)
+    for dd in (3, 5, 8):
+        if dd >= r * 0.8:
+            continue
+        pi = np.clip(np.round(cx + (r - dd) * ct).astype(int), 0, W - 1)
+        qi = np.clip(np.round(cy + (r - dd) * st).astype(int), 0, H - 1)
+        po = np.clip(np.round(cx + (r + dd) * ct).astype(int), 0, W - 1)
+        qo = np.clip(np.round(cy + (r + dd) * st).astype(int), 0, H - 1)
         step = max(step, float(np.abs(gblur[qi, pi] - gblur[qo, po]).mean()))
-    return cov, cov - max(inner, outer), step
+    return float(near.mean()), float(coh.mean()), float(gap), float(step)
 
 
 def detect_rings(gray: np.ndarray, mask: np.ndarray, scale: float,
-                 emap=None) -> list[VectorPath]:
-    """Détecte les anneaux circulaires (grands cercles concentriques) par couverture d'arêtes.
+                 maps=None) -> list[VectorPath]:
+    """Détecte les cercles parfaits, y compris partiels (occlus), non concentriques
+    et à double piste.
 
-    Les anneaux gravés/imprimés ne sont pas toujours des frontières encre/fond du
-    masque binaire : on cherche donc des cercles le long desquels les arêtes (Canny
-    à seuils bas) sont présentes et isolées radialement, autour d'un centre dominant
-    déduit des meilleurs candidats géométriques du masque.
+    Candidats : balayage radial autour des 4 principaux centres de clusters de
+    contours (anneaux concentriques multi-centres) et transformée de Hough
+    (petits cercles multi-centres, sans plafond arbitraire : top 1000 triés
+    par couverture). Chaque candidat est affiné par hill-climbing sur la
+    couverture d'arêtes (240 angles), puis validé par : couverture stricte
+    (>= 0.7, occlusion <= 30 %) ou cohérente (gradient radial >= 0.55),
+    proéminence radiale avec fenêtre dépendant de la taille (seuil 0.12 pour
+    les grands cercles, 0.15 sinon), contraste de luminance, et dispersion
+    radiale (std/mean du rayon réel des arêtes <= 0.05) qui rejette les
+    glyphes ressemblant à des cercles (lettres O, etc.).
+
+    Limites connues sur photos très texturées : cercles internes des
+    engrenages à double piste serrée et petits cercles noyés dans la texture
+    (rivets) peuvent être rejetés par la proéminence ; ils restent alors
+    présents comme tracés généraux (polylignes) dans le SVG/DXF.
     """
-    H, W = gray.shape
+    dist, labels, ang, gmag, gblur = maps if maps is not None else build_ring_maps(gray)
+    H, W = dist.shape
     max_dim = float(max(H, W))
-    if emap is None:
-        emap = edge_coverage_map(gray)
-    dist, gblur = emap
     if np.count_nonzero(dist == 0) < 50:
         return []
 
+    th = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
+    thr = np.linspace(0.0, 2.0 * np.pi, 240, endpoint=False)
+    thq = np.linspace(0.0, 2.0 * np.pi, 180, endpoint=False)
+    thp = np.linspace(0.0, 2.0 * np.pi, 360, endpoint=False)
+    ct, st = np.cos(th), np.sin(th)
+    crt, srt = np.cos(thr), np.sin(thr)
+    cqt, sqt = np.cos(thq), np.sin(thq)
+    cpt, spt = np.cos(thp), np.sin(thp)
+
+    def sample(cx, cy, r, cos_t, sin_t):
+        px = np.clip(np.round(cx + r * cos_t).astype(int), 0, W - 1)
+        py = np.clip(np.round(cy + r * sin_t).astype(int), 0, H - 1)
+        return px, py
+
+    def cov_at(cx, cy, r, cos_t, sin_t):
+        px, py = sample(cx, cy, r, cos_t, sin_t)
+        return float((dist[py, px] <= 3.0).mean())
+
+    def near_hits(cx, cy, r, cos_t=None, sin_t=None):
+        cos_t = ct if cos_t is None else cos_t
+        sin_t = st if sin_t is None else sin_t
+        px, py = sample(cx, cy, r, cos_t, sin_t)
+        return dist[py, px] <= 3.0
+
+    def quick_cov(cx, cy, r):
+        px, py = sample(cx, cy, r, cqt, sqt)
+        return float((dist[py, px] <= 3.0).mean())
+
+    def cov_fast(cx, cy, r):
+        px, py = sample(cx, cy, r, crt, srt)
+        return float((dist[py, px] <= 3.0).mean())
+
+    def coh_hits(cx, cy, r, cos_t=None, sin_t=None):
+        cos_t = ct if cos_t is None else cos_t
+        sin_t = st if sin_t is None else sin_t
+        px, py = sample(cx, cy, r, cos_t, sin_t)
+        near = dist[py, px] <= 3.0
+        lab = labels[py, px]
+        d = np.abs((ang[lab] - np.arctan2(py - cy, px - cx) + np.pi) % (2.0 * np.pi) - np.pi)
+        return near & (d < math.radians(45.0)) & (gmag[lab] > 15.0)
+
+    def gap_of(hit):
+        idx = np.nonzero(~hit)[0]
+        n = len(hit)
+        if len(idx) == 0:
+            return 0.0
+        if len(idx) == n:
+            return 1.0
+        runs = np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1)
+        g = max(len(x) for x in runs) / n
+        if not hit[0] and not hit[-1]:
+            g = max(g, (len(runs[0]) + len(runs[-1])) / n)
+        return g
+
+    def prom_of(hitfn, cx, cy, r, center_cov, cos_t, sin_t):
+        wf = 0.12 if r < 0.15 * max_dim else 0.045
+        d0, d1 = max(4.0, 0.03 * r), max(10.0, wf * r)
+        offs = np.arange(d0, d1, max(2.0, (d1 - d0) / 7.0))
+        sides = [float(hitfn(cx, cy, r + s * d, cos_t, sin_t).mean())
+                 for d in offs for s in (-1.0, 1.0)]
+        return center_cov - max(sides)
+
+    def dispersion(cx, cy, r):
+        n = int(min(1440, max(360, math.pi * r)))
+        thd = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+        drs = np.arange(-4.0, 4.5, 1.0)
+        ct_d = np.cos(thd)
+        st_d = np.sin(thd)
+        stack = np.stack([
+            dist[np.clip(np.round(cy + (r + dr) * st_d).astype(int), 0, H - 1),
+                 np.clip(np.round(cx + (r + dr) * ct_d).astype(int), 0, W - 1)]
+            for dr in drs])
+        best = np.argmin(stack, axis=0)
+        dmin = stack[best, np.arange(n)]
+        sel = dmin <= 3.0
+        if int(sel.sum()) < 30:
+            return 1.0
+        rr = r + drs[best[sel]]
+        return float(rr.std() / rr.mean())
+
+    def step_of(cx, cy, r, cos_t, sin_t):
+        best = 0.0
+        for d in (3, 5, 8):
+            if d >= r * 0.8:
+                continue
+            pi, qi = sample(cx, cy, r - d, cos_t, sin_t)
+            po, qo = sample(cx, cy, r + d, cos_t, sin_t)
+            best = max(best, float(np.abs(gblur[qi, pi] - gblur[qo, po]).mean()))
+        return best
+
+    def refine(cx, cy, r):
+        px, py = sample(cx, cy, r, crt, srt)
+        cov = float((dist[py, px] <= 3.0).mean())
+        moves = 0
+        for step in (4.0, 2.0, 1.0):
+            improved = True
+            while improved and moves < 80:
+                improved = False
+                for dx, dy, dr in ((step, 0, 0), (-step, 0, 0), (0, step, 0), (0, -step, 0),
+                                   (0, 0, step), (0, 0, -step)):
+                    qx, qy = sample(cx + dx, cy + dy, r + dr, crt, srt)
+                    c2 = float((dist[qy, qx] <= 3.0).mean())
+                    if c2 > cov + 1e-6:
+                        cx, cy, r, cov = cx + dx, cy + dy, r + dr, c2
+                        improved = True
+                        moves += 1
+        return cx, cy, r
+
+    fits = []
     contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
-    cands = []
     for c in contours:
         pts = c.reshape(-1, 2).astype(np.float64)
         if len(pts) < 40:
@@ -410,100 +554,118 @@ def detect_rings(gray: np.ndarray, mask: np.ndarray, scale: float,
         fit = circle_fit(pts[::2])
         if fit is None:
             continue
-        cx, cy, r, emax = fit
-        if not (0.04 * max_dim <= r <= 0.8 * max_dim) or emax > max(2.0, 0.02 * r):
+        fx, fy, fr, femax = fit
+        if not (0.04 * max_dim <= fr <= 0.8 * max_dim) or femax > max(2.0, 0.02 * fr):
             continue
-        cands.append([cx, cy, r, float(len(pts))])
-
-    if cands:
-        cluster_tol = 0.08 * max_dim
-        used = [False] * len(cands)
+        fits.append([fx, fy, fr, float(len(pts))])
+    if fits:
+        tol = 0.08 * max_dim
+        used = [False] * len(fits)
         clusters = []
-        for i in range(len(cands)):
+        for i in range(len(fits)):
             if used[i]:
                 continue
-            members = [i]
+            mem = [i]
             used[i] = True
-            for j in range(i + 1, len(cands)):
-                if not used[j] and math.hypot(cands[i][0] - cands[j][0], cands[i][1] - cands[j][1]) < cluster_tol:
-                    members.append(j)
+            for j in range(i + 1, len(fits)):
+                if not used[j] and math.hypot(fits[i][0] - fits[j][0], fits[i][1] - fits[j][1]) < tol:
+                    mem.append(j)
                     used[j] = True
-            wsum = sum(cands[m][3] for m in members)
-            cx = sum(cands[m][0] * cands[m][3] for m in members) / wsum
-            cy = sum(cands[m][1] * cands[m][3] for m in members) / wsum
-            clusters.append((cx, cy, wsum))
+            w = sum(fits[m][3] for m in mem)
+            clusters.append((sum(fits[m][0] * fits[m][3] for m in mem) / w,
+                             sum(fits[m][1] * fits[m][3] for m in mem) / w, w))
         clusters.sort(key=lambda t: -t[2])
-        center = (clusters[0][0], clusters[0][1])
+        centers = [(c[0], c[1]) for c in clusters[:4]]
     else:
         ys, xs = np.nonzero(mask)
         if len(xs) == 0:
             return []
-        center = (float(xs.mean()), float(ys.mean()))
+        centers = [(float(xs.mean()), float(ys.mean()))]
 
-    th = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
-    ct, st = np.cos(th), np.sin(th)
+    cands = []
+    for ccx, ccy in centers:
+        for r in np.arange(max(8.0, 0.04 * max_dim), 0.85 * max_dim, 2.0):
+            if cov_at(ccx, ccy, float(r), ct, st) >= 0.5:
+                cands.append((ccx, ccy, float(r), ccx, ccy))
 
-    def coverage(cx: float, cy: float, r: float) -> float:
-        px = np.clip(np.round(cx + r * ct).astype(int), 0, W - 1)
-        py = np.clip(np.round(cy + r * st).astype(int), 0, H - 1)
-        return float((dist[py, px] <= 3.0).mean())
+    smooth = cv2.GaussianBlur(gray, (5, 5), 1.2)
+    hc = cv2.HoughCircles(smooth, cv2.HOUGH_GRADIENT, dp=2.0, minDist=14, param1=60, param2=30,
+                          minRadius=int(0.012 * max_dim), maxRadius=int(0.45 * max_dim))
+    if hc is not None:
+        for hx, hy, hr in hc[0]:
+            hx, hy, hr = float(hx), float(hy), float(hr)
+            if quick_cov(hx, hy, hr) < 0.55:
+                continue
+            cands.append((hx, hy, hr, None, None))
 
-    def prominence(cx: float, cy: float, r: float) -> float:
-        c0 = coverage(cx, cy, r)
-        inner = min(coverage(cx, cy, r - d) for d in range(6, 26, 2))
-        outer = min(coverage(cx, cy, r + d) for d in range(6, 26, 2))
-        return c0 - max(inner, outer)
+    cell = 24.0
+    grid: dict[tuple[int, int], list] = {}
+    pruned = []
+    for cx, cy, r, scx, scy in cands:
+        gx, gy = int(cx // cell), int(cy // cell)
+        dup = False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for px, py, pr in grid.get((gx + dx, gy + dy), ()):
+                    if math.hypot(cx - px, cy - py) < 6.0 and abs(r - pr) < max(4.0, 0.04 * r):
+                        dup = True
+                        break
+                if dup:
+                    break
+            if dup:
+                break
+        if dup:
+            continue
+        pruned.append((cx, cy, r, scx, scy))
+        grid.setdefault((gx, gy), []).append((cx, cy, r))
 
-    def step_score(cx: float, cy: float, r: float) -> float:
-        score = 0.0
-        for d in (3, 5, 8):
-            pi = np.clip(np.round(cx + (r - d) * ct).astype(int), 0, W - 1)
-            qi = np.clip(np.round(cy + (r - d) * st).astype(int), 0, H - 1)
-            po = np.clip(np.round(cx + (r + d) * ct).astype(int), 0, W - 1)
-            qo = np.clip(np.round(cy + (r + d) * st).astype(int), 0, H - 1)
-            score = max(score, float(np.abs(gblur[qi, pi] - gblur[qo, po]).mean()))
-        return score
+    radial = [c for c in pruned if c[3] is not None]
+    hough = [c for c in pruned if c[3] is None]
+    hough.sort(key=lambda c: -float(near_hits(c[0], c[1], c[2]).mean()))
+    pruned = radial + hough[:1000]
 
-    def refine(cx: float, cy: float, r: float):
-        cov = coverage(cx, cy, r)
-        for step in (4.0, 2.0, 1.0):
-            improved = True
-            while improved:
-                improved = False
-                for dx, dy, dr in ((step, 0, 0), (-step, 0, 0), (0, step, 0), (0, -step, 0),
-                                   (0, 0, step), (0, 0, -step)):
-                    c2 = coverage(cx + dx, cy + dy, r + dr)
-                    if c2 > cov + 1e-6:
-                        cx, cy, r, cov = cx + dx, cy + dy, r + dr, c2
-                        improved = True
-        return cx, cy, r, cov
+    results = []
+    for cx0, cy0, r0, scx, scy in pruned:
+        cx, cy, r = refine(cx0, cy0, r0)
+        if not (0.012 * max_dim <= r <= 0.8 * max_dim):
+            continue
+        if scx is not None and math.hypot(cx - scx, cy - scy) > 0.06 * max_dim:
+            continue
+        nh = near_hits(cx, cy, r)
+        cov_n = float(nh.mean())
+        gap_n = gap_of(nh)
+        ch = coh_hits(cx, cy, r)
+        cov_c = float(ch.mean())
+        gap_c = gap_of(ch)
+        alive_strict = cov_n >= 0.7 and gap_n <= 0.30
+        alive_coh = cov_c >= 0.55 and gap_c <= 0.30
+        if not (alive_strict or alive_coh):
+            continue
+        prom_n = prom_of(near_hits, cx, cy, r, float(cov_n), ct, st) if alive_strict else -1.0
+        prom_c = prom_of(coh_hits, cx, cy, r, float(cov_c), ct, st) if alive_coh else -1.0
+        pmin = 0.12 if r >= 0.15 * max_dim else 0.15
+        if not ((alive_strict and prom_n >= pmin) or (alive_coh and prom_c >= pmin)):
+            continue
+        step = step_of(cx, cy, r, cpt, spt)
+        ok_strict = alive_strict and prom_n >= pmin and step >= 30.0
+        ok_coh = alive_coh and prom_c >= pmin and step >= 30.0
+        if not (ok_strict or ok_coh):
+            continue
+        if dispersion(cx, cy, r) > 0.05:
+            continue
+        results.append((cx, cy, r, max(cov_n, cov_c)))
 
-    radii = np.arange(max(8.0, 0.04 * max_dim), 0.85 * max_dim, 2.0)
-    if len(radii) < 3:
-        return []
-    covs = np.array([coverage(center[0], center[1], r) for r in radii])
-    peaks = [float(radii[i]) for i in range(1, len(radii) - 1)
-             if covs[i] >= 0.5 and covs[i] >= covs[i - 1] and covs[i] >= covs[i + 1]]
-
+    results.sort(key=lambda t: -t[3])
     kept = []
-    for r0 in peaks:
-        cx, cy, r, cov = refine(center[0], center[1], r0)
-        cov2, prom, step = ring_scores(dist, gblur, cx, cy, r)
-        if cov2 < 0.7 or prom < 0.2 or step < 30.0:
+    for cx, cy, r, _ in results:
+        if any(math.hypot(cx - kx, cy - ky) < max(10.0, 0.05 * r) and
+               abs(r - kr) < max(5.0, 0.05 * r) for kx, ky, kr in kept):
             continue
-        if not (0.04 * max_dim <= r <= 0.8 * max_dim):
-            continue
-        if math.hypot(cx - center[0], cy - center[1]) > 0.06 * max_dim:
-            continue
-        if any(math.hypot(cx - kx, cy - ky) < 10 and abs(r - kr) < max(4.0, 0.02 * r)
-               for kx, ky, kr, _ in kept):
-            continue
-        kept.append((cx, cy, r, cov))
+        kept.append((cx, cy, r))
     kept.sort(key=lambda t: -t[2])
     return [VectorPath(points=[], closed=True, kind="circle",
                        center=(cx / scale, cy / scale), radius=r / scale)
-            for cx, cy, r, _ in kept]
-
+            for cx, cy, r in kept]
 
 def strip_points_near_circles(paths: list[VectorPath], circles: list[VectorPath], band: float) -> list[VectorPath]:
     if not circles:
@@ -765,18 +927,18 @@ class ImageVectorAgent:
             closed_count = sum(1 for p in paths if p.closed)
         if self.fit_curves:
             paths = detect_curves(paths, tol / scale, max(w0, h0))
-            emap = edge_coverage_map(gray)
+            maps = build_ring_maps(gray)
             verified = []
             for p in paths:
                 if p.kind == "circle":
-                    cov, prom, step = ring_scores(emap[0], emap[1],
-                                                  p.center[0] * scale, p.center[1] * scale,
-                                                  p.radius * scale)
-                    if cov < 0.7 or step < 30.0:
+                    cov_n, cov_c, gap_n, step = ring_scores(maps,
+                                                            p.center[0] * scale, p.center[1] * scale,
+                                                            p.radius * scale)
+                    if not ((cov_n >= 0.7 or cov_c >= 0.55) and gap_n <= 0.3 and step >= 30.0):
                         p = VectorPath(points=curve_points(p), closed=True)
                 verified.append(p)
             paths = verified
-            ring_circles = detect_rings(gray, mask, scale, emap=emap)
+            ring_circles = detect_rings(gray, mask, scale, maps=maps)
             existing = [p for p in paths if p.kind == "circle"
                         or (p.kind == "arc" and abs(p.sweep) >= 180.0)]
             new_circles = []
