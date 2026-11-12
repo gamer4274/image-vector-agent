@@ -177,7 +177,7 @@ def convert():
         scale=scale,
         invert=request.form.get("invert") == "1",
         close_lines=close_lines,
-        closed_only=close_lines,
+        closed_only=False,
     )
     try:
         report = agent.run(src, job_dir)

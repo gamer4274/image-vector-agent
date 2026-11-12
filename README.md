@@ -65,14 +65,14 @@ python agent.py plan.jpg -o sortie/ --threshold adaptive --min-area 1e-5
 Pour préparer un DXF à la gravure ou la découpe laser, les tracés doivent être fermés :
 
 ```bash
-python agent.py logo.jpg -o sortie/ --mode edges --close --closed-only --unit mm --scale 0.1
+python agent.py logo.jpg -o sortie/ --mode edges --close --unit mm --scale 0.1
 ```
 
-- `--close` raccorde les extrémités proches (chaînes de segments recollés) et ferme les boucles ;
-- `--closed-only` supprime les traits restés ouverts pour ne garder que des contours fermés ;
+- `--close` raccorde les extrémités proches en plusieurs passes (distance croissante), fusionne les segments en chaînes et ferme les boucles. Aucune géométrie n'est supprimée : les traits intrinsèquement ouverts (qui ne peuvent être refermés sans tracer une fausse ligne) restent ouverts ;
+- `--closed-only` (découpe) : supprime en plus les traits restés ouverts pour un DXF 100 % contours fermés — à réserver à la découpe, car cela retire du contenu ;
 - ajustez `--gap` si des boucles ne se ferment pas (augmenter) ou si des zones distinctes se recollent (diminuer).
 
-Dans l'interface web, la case « Tracés fermés (gravure / découpe laser) » active les deux comportements.
+Dans l'interface web, la case « Tracés fermés (gravure / découpe laser) » active `--close` sans suppression.
 
 ## Qualité
 
