@@ -287,30 +287,7 @@ def close_paths(paths: list[VectorPath], gap: float, closed_only: bool) -> list[
         ends.append((i, 0, p.points[0]))
         ends.append((i, 1, p.points[-1]))
     coords = np.array([[e[2][0], e[2][1]] for e in ends])
-    tree = cKDTree(coords)
-    raw_pairs = tree.query_pairs(gap, output_type="ndarray")
-
-    degree = np.zeros(len(ends), dtype=int)
-    candidates = []
-    for a, b in raw_pairs:
-        a, b = int(a), int(b)
-        if ends[a][0] == ends[b][0]:
-            continue
-        candidates.append((float(np.hypot(*(coords[a] - coords[b]))), a, b))
-        degree[a] += 1
-        degree[b] += 1
-    candidates.sort()
-
-    phase1 = [c for c in candidates if degree[c[1]] == 1 and degree[c[2]] == 1]
-    phase2 = [c for c in candidates if not (degree[c[1]] == 1 and degree[c[2]] == 1)]
-
-    def opposite_distance(a, b):
-        pa, wa = ends[a][0], ends[a][1]
-        pb, wb = ends[b][0], ends[b][1]
-        oa, ob = 2 * pa + (1 - wa), 2 * pb + (1 - wb)
-        return float(np.hypot(*(coords[oa] - coords[ob])))
-
-    phase2.sort(key=lambda c: (-opposite_distance(c[1], c[2]), c[0]))
+    max_dim = float(coords[:, 0].max() - coords[:, 0].min() + coords[:, 1].max() - coords[:, 1].min()) / 2.0
 
     chains = {}
     for i, p in enumerate(opens):
@@ -325,38 +302,113 @@ def close_paths(paths: list[VectorPath], gap: float, closed_only: bool) -> list[
             return chain["pts"], chain["e_end"]
         return chain["pts"][::-1], chain["e_start"]
 
-    for _, a, b in phase1 + phase2:
-        ca = end_chain.get((ends[a][0], ends[a][1]))
-        cb = end_chain.get((ends[b][0], ends[b][1]))
-        if ca is None or cb is None or ca == cb:
-            continue
-        A, B = chains[ca], chains[cb]
-        if A["closed"] or B["closed"]:
-            continue
-        end_a = (ends[a][0], ends[a][1])
-        end_b = (ends[b][0], ends[b][1])
-        pa, other_a = oriented(A, end_a)
-        pb, other_b = oriented(B, end_b)
-        merged = {"pts": pa + pb, "e_start": other_a, "e_end": other_b, "closed": False}
-        if other_a == other_b:
-            merged["pts"].append(merged["pts"][0])
-            merged["closed"] = True
-            merged["e_start"] = merged["e_end"] = None
-        del chains[ca], chains[cb]
-        end_chain.pop(end_a, None)
-        end_chain.pop(end_b, None)
+    def match_pass(tol: float) -> None:
+        free = [eid for eid, cid in end_chain.items() if not chains[cid]["closed"]]
+        if len(free) < 2:
+            return
+        idx_of = {eid: k for k, eid in enumerate(free)}
+        pts = np.array([ends[2 * eid[0] + eid[1]][2] for eid in free])
+        tree = cKDTree(pts)
+        raw = tree.query_pairs(tol, output_type="ndarray")
+        degree = np.zeros(len(free), dtype=int)
+        candidates = []
+        for a, b in raw:
+            a, b = int(a), int(b)
+            ea, eb = free[a], free[b]
+            if ea[0] == eb[0]:
+                continue
+            d = float(np.hypot(*(pts[a] - pts[b])))
+            candidates.append((d, ea, eb))
+            degree[a] += 1
+            degree[b] += 1
+        candidates.sort()
+        phase1 = [c for c in candidates if degree[idx_of[c[1]]] == 1 and degree[idx_of[c[2]]] == 1]
+        phase2 = [c for c in candidates if not (degree[idx_of[c[1]]] == 1 and degree[idx_of[c[2]]] == 1)]
+
+        def opposite_distance(ea, eb):
+            oa = 2 * ea[0] + (1 - ea[1])
+            ob = 2 * eb[0] + (1 - eb[1])
+            return float(np.hypot(*(coords[oa] - coords[ob])))
+
+        phase2.sort(key=lambda c: (-opposite_distance(c[1], c[2]), c[0]))
+
+        for _, ea, eb in phase1 + phase2:
+            ca = end_chain.get(ea)
+            cb = end_chain.get(eb)
+            if ca is None or cb is None:
+                continue
+            if ca == cb:
+                C = chains[ca]
+                if not C["closed"]:
+                    C["pts"].append(C["pts"][0])
+                    C["closed"] = True
+                    end_chain.pop(C["e_start"], None)
+                    end_chain.pop(C["e_end"], None)
+                    C["e_start"] = C["e_end"] = None
+                continue
+            A, B = chains[ca], chains[cb]
+            if A["closed"] or B["closed"]:
+                continue
+            pa, other_a = oriented(A, ea)
+            pb, other_b = oriented(B, eb)
+            merged = {"pts": pa[::-1] + pb, "e_start": other_a, "e_end": other_b, "closed": False}
+            del chains[ca], chains[cb]
+            end_chain.pop(ea, None)
+            end_chain.pop(eb, None)
+            new_id = max(chains, default=-1) + 1
+            chains[new_id] = merged
+            if merged["e_start"] is not None:
+                end_chain[merged["e_start"]] = new_id
+                end_chain[merged["e_end"]] = new_id
+
+    for factor in (1.0, 2.0, 4.0):
+        match_pass(gap * factor)
+
+    def self_bridge(cid) -> None:
+        c = chains[cid]
+        c["pts"].append(c["pts"][0])
+        c["closed"] = True
+        c["e_start"] = c["e_end"] = None
+
+    bridge_limit = 0.10 * max_dim
+    for cid in list(chains):
+        c = chains[cid]
+        if not c["closed"] and math.dist(c["pts"][0], c["pts"][-1]) <= bridge_limit:
+            self_bridge(cid)
+
+    far_ids = [cid for cid, c in chains.items() if not c["closed"]]
+    while len(far_ids) > 1:
+        best = None
+        for ii in range(len(far_ids)):
+            for jj in range(ii + 1, len(far_ids)):
+                A, B = chains[far_ids[ii]], chains[far_ids[jj]]
+                for ea in (A["e_start"], A["e_end"]):
+                    for eb in (B["e_start"], B["e_end"]):
+                        d = math.dist(ends[2 * ea[0] + ea[1]][2], ends[2 * eb[0] + eb[1]][2])
+                        if best is None or d < best[0]:
+                            best = (d, ii, jj, ea, eb)
+        if best[0] > bridge_limit:
+            break
+        _, ii, jj, ea, eb = best
+        cid_a, cid_b = far_ids[ii], far_ids[jj]
+        A, B = chains[cid_a], chains[cid_b]
+        pa, other_a = oriented(A, ea)
+        pb, other_b = oriented(B, eb)
+        merged = {"pts": pa[::-1] + pb, "e_start": other_a, "e_end": other_b, "closed": False}
+        del chains[cid_a], chains[cid_b]
+        end_chain.pop(ea, None)
+        end_chain.pop(eb, None)
         new_id = max(chains, default=-1) + 1
         chains[new_id] = merged
-        if merged["e_start"] is not None:
-            end_chain[merged["e_start"]] = new_id
-            end_chain[merged["e_end"]] = new_id
+        far_ids = [x for k, x in enumerate(far_ids) if k not in (ii, jj)]
+        if not merged["closed"]:
+            far_ids.append(new_id)
+    for cid in list(chains):
+        c = chains[cid]
+        if not c["closed"] and math.dist(c["pts"][0], c["pts"][-1]) <= bridge_limit:
+            self_bridge(cid)
 
     for c in chains.values():
-        if not c["closed"]:
-            d = math.dist(c["pts"][0], c["pts"][-1])
-            if d <= gap * 2.5:
-                c["pts"].append(c["pts"][0])
-                c["closed"] = True
         if c["closed"] or not closed_only:
             result.append(VectorPath(points=c["pts"], closed=c["closed"]))
     return result
