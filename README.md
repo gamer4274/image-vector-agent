@@ -15,7 +15,8 @@ Convertit une image JPEG (scan de plan, dessin technique, schéma, logo) en fich
 4. **Extraction** :
    - mode `centerline` (défaut) : squelettisation puis parcours du graphe de pixels → tracés centraux d'un seul trait, idéaux pour plans et dessins au trait ;
    - mode `outline` : contours des zones pleines (logos, formes remplies) ;
-   - mode `auto` : choisit selon la densité d'encre.
+   - mode `edges` : détection d'arêtes (Canny) puis tracé central — capture tous les détails internes d'une image tonale (cercles, engrenages, visages) ;
+   - mode `auto` : choisit selon la densité d'encre, détecte un fond sombre (polarité inversée automatique) et bascule vers `edges` si le tracé central est trop bruité.
 5. **Simplification** : Douglas-Peucker avec tolérance sub-pixel (préréglage `high` = 0,8 px) pour un fichier léger mais fidèle.
 6. **Export** SVG + DXF + aperçu + rapport.
 
@@ -47,7 +48,7 @@ python agent.py plan.jpg -o sortie/ --threshold adaptive --min-area 1e-5
 
 | Option | Valeurs | Rôle |
 |---|---|---|
-| `--mode` | `auto`, `centerline`, `outline` | Stratégie d'extraction |
+| `--mode` | `auto`, `centerline`, `outline`, `edges` | Stratégie d'extraction |
 | `--quality` | `max`, `high`, `balanced` | Tolérance de simplification (0,45 / 0,8 / 1,6 px) |
 | `--tolerance` | float | Tolérance manuelle en px image |
 | `--threshold` | `auto`, `otsu`, `adaptive` | Méthode de binarisation |
