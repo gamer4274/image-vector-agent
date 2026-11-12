@@ -21,6 +21,21 @@ Convertit une image JPEG (scan de plan, dessin technique, schéma, logo) en fich
 
 ## Usage
 
+### Interface web
+
+```bash
+pip install -r requirements.txt
+python webapp.py
+```
+
+Ouvrez ensuite http://127.0.0.1:8000 dans un navigateur : chargez une image, choisissez
+les options, puis téléchargez le SVG et le DXF depuis la page de résultat (aperçu inclus).
+
+Options disponibles : mode d'extraction, qualité du tracé, unités et échelle du DXF,
+tracé clair sur fond sombre. Formats acceptés : JPEG, PNG, BMP, WebP, TIFF (32 Mo max).
+
+### Ligne de commande
+
 ```bash
 pip install -r requirements.txt
 
