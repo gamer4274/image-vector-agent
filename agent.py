@@ -208,9 +208,12 @@ def prune_and_simplify(paths: list, tolerance: float, scale: float) -> list[Vect
 
 def extract_outlines(mask: np.ndarray, tolerance: float, scale: float) -> list[VectorPath]:
     contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    h, w = mask.shape
+    min_area = max(8.0, 5e-5 * h * w)
+    min_perimeter = max(24.0, 0.03 * max(h, w))
     result = []
     for c in contours:
-        if cv2.contourArea(c) < 4.0 and cv2.arcLength(c, False) < 12.0:
+        if cv2.contourArea(c) < min_area and cv2.arcLength(c, False) < min_perimeter:
             continue
         simple = approximate_polygon(c.reshape(-1, 2).astype(np.float64), tolerance=tolerance)
         if len(simple) < 3:
@@ -280,7 +283,18 @@ class ImageVectorAgent:
         gray0 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         gray, scale = preprocess(gray0)
-        mask, tmethod = binarize(gray, self.threshold, self.invert)
+        invert = self.invert
+        polarity = "clair" if invert else "sombre"
+        if not invert:
+            b = 4
+            border = np.concatenate([
+                gray0[:b, :].ravel(), gray0[-b:, :].ravel(),
+                gray0[:, :b].ravel(), gray0[:, -b:].ravel(),
+            ])
+            if float(border.mean()) < 110.0:
+                invert = True
+                polarity = "clair"
+        mask, tmethod = binarize(gray, self.threshold, invert)
         mask = remove_specks(mask, self.min_area_frac)
         ink_fraction = float(np.count_nonzero(mask)) / mask.size
         if ink_fraction < 0.0005:
@@ -299,6 +313,9 @@ class ImageVectorAgent:
         if mode == "centerline":
             skel = skeletonize(mask > 0).astype(np.uint8) * 255
             paths = prune_and_simplify(trace_skeleton(skel), tol, scale)
+            if len(paths) > 1.5 * max(w0, h0):
+                mode = "outline"
+                paths = extract_outlines(mask, tol, scale)
         else:
             paths = extract_outlines(mask, tol, scale)
 
@@ -317,7 +334,7 @@ class ImageVectorAgent:
             blur_variance=round(float(cv2.Laplacian(gray0, cv2.CV_64F).var()), 2),
             noise_sigma=round(float(np.median(np.abs(cv2.Laplacian(gray0, cv2.CV_64F))) / 0.6745), 2),
             ink_fraction=round(ink_fraction, 4),
-            ink_polarity="sombre" if not self.invert else "clair",
+            ink_polarity=polarity,
             threshold_method=tmethod,
             stroke_width_px=round(stroke_out, 2),
             mode_used=mode,
@@ -325,8 +342,9 @@ class ImageVectorAgent:
         report = {
             "source": str(src),
             "analysis": asdict(analysis),
-            "parameters": {"mode": self.mode, "quality": self.quality, "tolerance_px": round(tol / scale, 3),
-                           "threshold": self.threshold, "invert": self.invert, "unit": self.unit, "scale": self.scale},
+            "parameters": {"mode": self.mode, "mode_effectif": mode, "quality": self.quality,
+                           "tolerance_px": round(tol / scale, 3),
+                           "threshold": self.threshold, "invert": invert, "unit": self.unit, "scale": self.scale},
             "paths": len(paths),
             "points": sum(len(p.points) for p in paths),
             "outputs": {"svg": str(svg_path), "dxf": str(dxf_path), "preview": str(preview_path),
