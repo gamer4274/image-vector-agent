@@ -329,7 +329,8 @@ class ImageVectorAgent:
                            "threshold": self.threshold, "invert": self.invert, "unit": self.unit, "scale": self.scale},
             "paths": len(paths),
             "points": sum(len(p.points) for p in paths),
-            "outputs": {"svg": str(svg_path), "dxf": str(dxf_path), "preview": str(preview_path)},
+            "outputs": {"svg": str(svg_path), "dxf": str(dxf_path), "preview": str(preview_path),
+                         "report": str(outdir / (src.stem + "_report.json"))},
         }
         (outdir / (src.stem + "_report.json")).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         return report
