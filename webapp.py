@@ -105,6 +105,10 @@ FORM_BODY = """<div class="card">
       <input type="checkbox" name="invert" value="1" style="width:auto">
       Tracé clair sur fond sombre
     </label>
+    <label style="font-weight:400">
+      <input type="checkbox" name="close" value="1" style="width:auto" checked>
+      Tracés fermés (gravure / découpe laser)
+    </label>
     <button type="submit">Convertir</button>
   </form>
 </div>"""
@@ -113,7 +117,7 @@ RESULT_BODY = """<div class="card">
   <h1>Résultat de la conversion</h1>
   <p><strong>{{ report.source }}</strong> — {{ report.analysis.width }}×{{ report.analysis.height }} px,
      mode {{ report.analysis.mode_used }}, seuillage {{ report.analysis.threshold_method }},
-     {{ report.paths }} tracés, {{ report.points }} points.</p>
+     {{ report.paths }} tracés (dont {{ report.closed_paths }} fermés), {{ report.points }} points.</p>
   <img class="preview" src="{{ url_for('download', job_id=job_id, filename=preview_name) }}" alt="Aperçu du tracé">
   <table>
     <tr><th>Contraste (écart-type)</th><td>{{ report.analysis.contrast_std }}</td></tr>
@@ -165,12 +169,15 @@ def convert():
     except ValueError:
         scale = 1.0
 
+    close_lines = request.form.get("close") == "1"
     agent = ImageVectorAgent(
         mode=request.form.get("mode", "auto"),
         quality=request.form.get("quality", "high"),
         unit=request.form.get("unit", "px"),
         scale=scale,
         invert=request.form.get("invert") == "1",
+        close_lines=close_lines,
+        closed_only=close_lines,
     )
     try:
         report = agent.run(src, job_dir)

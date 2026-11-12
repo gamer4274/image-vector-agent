@@ -56,6 +56,23 @@ python agent.py plan.jpg -o sortie/ --threshold adaptive --min-area 1e-5
 | `--unit` | `px`, `mm`, `cm`, `in` | Unités du DXF |
 | `--scale` | float | Échelle des coordonnées DXF (ex. 0,1 = 1 px → 0,1 mm) |
 | `--min-area` | float | Seuil anti-parasites (fraction de surface, défaut 2e-5) |
+| `--close` | flag | Ferme les tracés : raccorde les extrémités proches en boucles (gravure/découpe laser) |
+| `--closed-only` | flag | Ne conserve que les tracés fermés |
+| `--gap` | float | Distance max de raccord des extrémités en px (défaut auto : max(1,5 px ; 0,4 % de la taille)) |
+
+## Gravure laser
+
+Pour préparer un DXF à la gravure ou la découpe laser, les tracés doivent être fermés :
+
+```bash
+python agent.py logo.jpg -o sortie/ --mode edges --close --closed-only --unit mm --scale 0.1
+```
+
+- `--close` raccorde les extrémités proches (chaînes de segments recollés) et ferme les boucles ;
+- `--closed-only` supprime les traits restés ouverts pour ne garder que des contours fermés ;
+- ajustez `--gap` si des boucles ne se ferment pas (augmenter) ou si des zones distinctes se recollent (diminuer).
+
+Dans l'interface web, la case « Tracés fermés (gravure / découpe laser) » active les deux comportements.
 
 ## Qualité
 
