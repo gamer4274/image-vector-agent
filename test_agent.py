@@ -25,6 +25,7 @@ from agent import (
     circle_fit,
     close_paths,
     detect_curves,
+    detect_ellipses,
     detect_rings,
     load_image,
     preprocess,
@@ -73,7 +74,7 @@ def detect_on_canvas(img: np.ndarray) -> list:
     mask, _ = binarize(gray, "auto", False)
     mask = remove_specks(mask, 2e-5)
     maps = build_ring_maps(gray)
-    return detect_rings(gray, mask, scale, maps=maps)
+    return detect_rings(gray, mask, scale, maps=maps) + detect_ellipses(gray, mask, scale, maps=maps)
 
 
 def has_circle(circles, cx, cy, r, tol_c, tol_r) -> bool:
@@ -180,6 +181,54 @@ class TestDetectRings(unittest.TestCase):
         self.assertLess(duree, 20.0)
 
 
+class TestDetectEllipses(unittest.TestCase):
+    def ellipses_of(self, paths) -> list:
+        return [(p.center[0], p.center[1], p.axis_a, p.axis_b, p.tilt)
+                for p in paths if p.kind == "ellipse"]
+
+    def has_ellipse(self, els, cx, cy, a, b, tilt, tol) -> bool:
+        return any(abs(x - cx) <= tol and abs(y - cy) <= tol and abs(aa - a) <= tol
+                   and abs(bb - b) <= tol
+                   and min(abs(t - tilt), 180.0 - abs(t - tilt)) <= 6.0
+                   for x, y, aa, bb, t in els)
+
+    def test_ellipse_detectee(self):
+        img = make_canvas(800)
+        cv2.ellipse(img, (400, 400), (150, 75), 0, 0, 360, BLACK, 5)
+        els = self.ellipses_of(detect_on_canvas(img))
+        self.assertTrue(self.has_ellipse(els, 400, 400, 150, 75, 0, 6))
+
+    def test_ellipse_inclinee(self):
+        img = make_canvas(800)
+        cv2.ellipse(img, (400, 400), (150, 75), 30, 0, 360, BLACK, 5)
+        els = self.ellipses_of(detect_on_canvas(img))
+        self.assertTrue(self.has_ellipse(els, 400, 400, 150, 75, 30, 6))
+
+    def test_ellipse_occultee(self):
+        img = make_canvas(800)
+        cv2.ellipse(img, (400, 400), (150, 75), 0, 0, 300, BLACK, 5)
+        els = self.ellipses_of(detect_on_canvas(img))
+        self.assertTrue(self.has_ellipse(els, 400, 400, 150, 75, 0, 6))
+
+    def test_quasi_cercle_pas_ellipse(self):
+        img = make_canvas(800)
+        cv2.ellipse(img, (400, 400), (150, 140), 0, 0, 360, BLACK, 5)
+        els = self.ellipses_of(detect_on_canvas(img))
+        self.assertEqual(els, [])
+
+    def test_cercle_pas_ellipse(self):
+        img = make_canvas(800)
+        cv2.circle(img, (400, 400), 150, BLACK, 5)
+        els = self.ellipses_of(detect_on_canvas(img))
+        self.assertEqual(els, [])
+
+    def test_ligne_droite_pas_ellipse(self):
+        img = make_canvas(800)
+        cv2.line(img, (100, 100), (700, 700), BLACK, 4)
+        els = self.ellipses_of(detect_on_canvas(img))
+        self.assertEqual(els, [])
+
+
 class TestDetectCurves(unittest.TestCase):
     def test_polygone_circulaire_devient_cercle(self):
         th = np.linspace(0.0, 2.0 * np.pi, 48, endpoint=False)
@@ -262,6 +311,30 @@ class TestExports(unittest.TestCase):
         self.assertIn('<circle cx="100.00" cy="200.00" r="50.00"/>', txt)
         self.assertIn('fill="none"', txt)
 
+    def test_write_svg_ellipse(self):
+        p = VectorPath(points=[], closed=True, kind="ellipse", center=(100.0, 200.0),
+                       axis_a=80.0, axis_b=40.0, tilt=30.0)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "t.svg"
+            write_svg([p], 400, 400, 1.0, out)
+            txt = out.read_text(encoding="utf-8")
+        self.assertIn('<ellipse cx="100.00" cy="200.00" rx="80.00" ry="40.00"', txt)
+        self.assertIn('rotate(30.00 100.00 200.00)', txt)
+
+    def test_write_dxf_entite_ellipse(self):
+        p = VectorPath(points=[], closed=True, kind="ellipse", center=(100.0, 200.0),
+                       axis_a=80.0, axis_b=40.0, tilt=0.0)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "t.dxf"
+            write_dxf([p], 400, "px", 1.0, out)
+            doc = ezdxf.readfile(out)
+        e = next(e for e in doc.modelspace() if e.dxftype() == "ELLIPSE")
+        self.assertAlmostEqual(e.dxf.center[0], 100.0, places=4)
+        self.assertAlmostEqual(e.dxf.center[1], 200.0, places=4)
+        self.assertAlmostEqual(e.dxf.major_axis[0], 80.0, places=4)
+        self.assertAlmostEqual(e.dxf.major_axis[1], 0.0, places=4)
+        self.assertAlmostEqual(e.dxf.ratio, 0.5, places=4)
+
     def test_write_dxf_entites_cao(self):
         cercle = VectorPath(points=[], closed=True, kind="circle", center=(100.0, 200.0), radius=50.0)
         arc = VectorPath(points=[], closed=False, kind="arc", center=(300.0, 200.0), radius=40.0,
@@ -289,11 +362,13 @@ class TestPipelineComplet(unittest.TestCase):
             img = make_canvas(800)
             cv2.rectangle(img, (80, 80), (720, 720), BLACK, 3)
             cv2.circle(img, (400, 400), 180, BLACK, 3)
-            cv2.line(img, (80, 80), (720, 720), BLACK, 2)
+            cv2.ellipse(img, (400, 400), (120, 60), 25, 0, 360, BLACK, 3)
+            cv2.line(img, (80, 80), (220, 220), BLACK, 2)
             cv2.imwrite(str(src), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
             agent = ImageVectorAgent(quality="high")
             report = agent.run(src, outdir)
             self.assertGreaterEqual(report["circles"], 1)
+            self.assertGreaterEqual(report["ellipses"], 1)
             self.assertGreater(report["paths"], 0)
             for key in ("svg", "dxf", "preview", "report"):
                 self.assertTrue(Path(report["outputs"][key]).exists())

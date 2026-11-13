@@ -131,7 +131,8 @@ RESULT_BODY = """<div class="card">
   <h1>Résultat de la conversion</h1>
   <p><strong>{{ report.source }}</strong> — {{ report.analysis.width }}×{{ report.analysis.height }} px,
      mode {{ report.analysis.mode_used }}, seuillage {{ report.analysis.threshold_method }},
-     {{ report.paths }} tracés (dont {{ report.closed_paths }} fermés, {{ report.circles }} cercles et {{ report.arcs }} arcs parfaits), {{ report.points }} points.</p>
+     {{ report.paths }} tracés (dont {{ report.closed_paths }} fermés, {{ report.circles }} cercles,
+     {{ report.get('ellipses', 0) }} ellipses et {{ report.arcs }} arcs parfaits), {{ report.points }} points.</p>
   <img class="preview" src="{{ url_for('download', job_id=job_id, filename=preview_name) }}" alt="Aperçu du tracé">
   <table>
     <tr><th>Contraste (écart-type)</th><td>{{ report.analysis.contrast_std }}</td></tr>
