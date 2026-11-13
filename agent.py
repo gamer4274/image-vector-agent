@@ -53,6 +53,9 @@ class VectorPath:
     radius: float = 0.0
     start_angle: float = 0.0
     sweep: float = 0.0
+    axis_a: float = 0.0
+    axis_b: float = 0.0
+    tilt: float = 0.0
 
 
 def load_image(path: Path) -> np.ndarray:
@@ -254,6 +257,11 @@ def write_svg(paths: list[VectorPath], width: int, height: int, stroke_width: fl
             cx, cy = p.center
             lines.append(f'    <circle cx="{cx:.2f}" cy="{cy:.2f}" r="{p.radius:.2f}"/>')
             continue
+        if p.kind == "ellipse":
+            cx, cy = p.center
+            lines.append(f'    <ellipse cx="{cx:.2f}" cy="{cy:.2f}" rx="{p.axis_a:.2f}" ry="{p.axis_b:.2f}" '
+                         f'transform="rotate({p.tilt:.2f} {cx:.2f} {cy:.2f})"/>')
+            continue
         if p.kind == "arc":
             pts = curve_points(p)
             (sx, sy), (ex, ey) = pts[0], pts[-1]
@@ -283,6 +291,13 @@ def write_dxf(paths: list[VectorPath], height: int, unit: str, user_scale: float
         if p.kind == "circle":
             cx, cy = p.center
             msp.add_circle((cx * k, (height - cy) * k), p.radius * k, dxfattribs={"layer": "TRACE"})
+            continue
+        if p.kind == "ellipse":
+            cx, cy = p.center
+            tr = math.radians(p.tilt)
+            major = (p.axis_a * math.cos(tr) * k, -p.axis_a * math.sin(tr) * k)
+            ratio = p.axis_b / p.axis_a if p.axis_a > 0 else 1.0
+            msp.add_ellipse((cx * k, (height - cy) * k), major, ratio, dxfattribs={"layer": "TRACE"})
             continue
         if p.kind == "arc":
             cx, cy = p.center
@@ -667,6 +682,244 @@ def detect_rings(gray: np.ndarray, mask: np.ndarray, scale: float,
                        center=(cx / scale, cy / scale), radius=r / scale)
             for cx, cy, r in kept]
 
+def detect_ellipses(gray: np.ndarray, mask: np.ndarray, scale: float,
+                    maps=None) -> list[VectorPath]:
+    """Détecte les ellipses et ovales (les « faux cercles ») comme entités exactes.
+
+    Candidats : ajustement d'ellipse (cv2.fitEllipse) sur les contours du
+    masque. Chaque candidat est amorcé sur les bords du trait (± demi-épaisseur
+    estimée) puis affiné par descente de coordonnées bornée sur la couverture
+    d'arêtes (centre, axes, inclinaison). Validation : couverture >= 0.7, plus
+    grand secteur occlus <= 30 %, support du contour source sur l'ellipse
+    (>= 80 %), isolement radial (proéminence au-delà de l'épaisseur locale du
+    trait), dispersion radiale faible et épaisseur de trait uniforme le long
+    du chemin (rejette pistes et blobs fusionnés). Les quasi-cercles (ratio
+    d'axes > 0.92) sont laissés à detect_rings pour éviter les doublons ; les
+    petites ellipses (grand axe < 5 % de l'image, glyphes de texte) sont
+    rejetées par la taille minimale. Coords retournées : image originale.
+    """
+    dist, labels, ang, gmag, gblur = maps if maps is not None else build_ring_maps(gray)
+    H, W = dist.shape
+    max_dim = float(max(H, W))
+    if np.count_nonzero(dist == 0) < 50:
+        return []
+
+    th = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
+    thr = np.linspace(0.0, 2.0 * np.pi, 360, endpoint=False)
+    ct, st = np.cos(th), np.sin(th)
+    crt, srt = np.cos(thr), np.sin(thr)
+
+    def sample(cx, cy, a, b, tilt, cos_t, sin_t):
+        tr = math.radians(tilt)
+        ctr, str_ = math.cos(tr), math.sin(tr)
+        ex = a * cos_t
+        ey = b * sin_t
+        px = cx + ex * ctr - ey * str_
+        py = cy + ex * str_ + ey * ctr
+        return (np.clip(np.round(px).astype(int), 0, W - 1),
+                np.clip(np.round(py).astype(int), 0, H - 1))
+
+    def cov_at(cx, cy, a, b, tilt, cos_t, sin_t):
+        px, py = sample(cx, cy, a, b, tilt, cos_t, sin_t)
+        return float((dist[py, px] <= 3.0).mean())
+
+    def gap_of(hit):
+        idx = np.nonzero(~hit)[0]
+        n = len(hit)
+        if len(idx) == 0:
+            return 0.0
+        if len(idx) == n:
+            return 1.0
+        runs = np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1)
+        g = max(len(x) for x in runs) / n
+        if not hit[0] and not hit[-1]:
+            g = max(g, (len(runs[0]) + len(runs[-1])) / n)
+        return g
+
+    def width_profile(cx, cy, a, b, tilt):
+        tsw = np.linspace(0.0, 2.0 * np.pi, 72, endpoint=False)
+        px0, py0 = sample(cx, cy, a, b, tilt, np.cos(tsw), np.sin(tsw))
+        tr = math.radians(tilt)
+        widths = []
+        for i, (x0, y0) in enumerate(zip(px0, py0)):
+            t = tsw[i]
+            nx = b * math.cos(t) * math.cos(tr) - a * math.sin(t) * math.sin(tr)
+            ny = b * math.cos(t) * math.sin(tr) + a * math.sin(t) * math.cos(tr)
+            nn = math.hypot(nx, ny)
+            if nn < 1e-9:
+                continue
+            nx, ny = nx / nn, ny / nn
+            tot = 0.0
+            for s in (1.0, -1.0):
+                run = 0
+                for step in range(1, 41):
+                    x = int(round(x0 + s * step * nx))
+                    y = int(round(y0 + s * step * ny))
+                    if not (0 <= x < W and 0 <= y < H) or mask[y, x] == 0:
+                        break
+                    run = step
+                tot += run
+            widths.append(tot)
+        return np.array(widths, dtype=float)
+
+    def prom_of(cx, cy, a, b, tilt, center_cov, cos_t, sin_t):
+        sw = float(np.median(width_profile(cx, cy, a, b, tilt)))
+        rmean = 0.5 * (a + b)
+        d0 = max(6.0, sw + 6.0)
+        d1 = max(d0 + 4.0, 0.12 * rmean)
+        offs = np.arange(d0, d1 + 0.1, max(2.0, (d1 - d0) / 7.0))
+        sides = []
+        for d in offs:
+            fa = max(4.0, a - d)
+            fb = max(4.0, b - d)
+            ga = a + d
+            gb = b + d
+            sides.append(cov_at(cx, cy, fa, fb, tilt, cos_t, sin_t))
+            sides.append(cov_at(cx, cy, ga, gb, tilt, cos_t, sin_t))
+        return center_cov - max(sides)
+
+    def dispersion(cx, cy, a, b, tilt):
+        rmean = 0.5 * (a + b)
+        n = int(min(1440, max(360, 2.0 * math.pi * rmean)))
+        thd = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+        ctd, std_ = np.cos(thd), np.sin(thd)
+        px0, py0 = sample(cx, cy, a, b, tilt, ctd, std_)
+        vx, vy = px0 - cx, py0 - cy
+        r0 = np.hypot(vx, vy)
+        ux = vx / np.maximum(r0, 1e-9)
+        uy = vy / np.maximum(r0, 1e-9)
+        drs = np.arange(-4.0, 4.5, 1.0)
+        stack = np.stack([
+            dist[np.clip(np.round(cy + (r0 + dr) * uy).astype(int), 0, H - 1),
+                 np.clip(np.round(cx + (r0 + dr) * ux).astype(int), 0, W - 1)]
+            for dr in drs])
+        best = np.argmin(stack, axis=0)
+        dmin = stack[best, np.arange(n)]
+        sel = dmin <= 3.0
+        if int(sel.sum()) < 30:
+            return 1.0
+        err = drs[best[sel]]
+        return float(err.std() / max(1.0, float(r0[sel].mean())))
+
+    def refine(cx, cy, a, b, tilt):
+        cov = cov_at(cx, cy, a, b, tilt, crt, srt)
+        c0, a0, t0 = (cx, cy), a, tilt
+        dc = max(3.0, 0.02 * a0)
+        da = max(8.0, 0.08 * a0)
+        moves = 0
+        for step in (4.0, 2.0, 1.0):
+            improved = True
+            while improved and moves < 120:
+                improved = False
+                for idx in range(5):
+                    for s in (step, -step):
+                        params = [cx, cy, a, b, tilt]
+                        params[idx] += s
+                        if idx in (2, 3) and params[idx] < 4.0:
+                            continue
+                        if idx in (0, 1) and math.hypot(params[0] - c0[0], params[1] - c0[1]) > dc:
+                            continue
+                        if idx == 2 and abs(params[2] - a0) > da:
+                            continue
+                        if idx == 3 and abs(params[3] - a0) > da:
+                            continue
+                        if idx == 4 and min(abs(params[4] - t0), 180.0 - abs(params[4] - t0)) > 15.0:
+                            continue
+                        c2 = cov_at(params[0], params[1], params[2], params[3],
+                                    params[4], crt, srt)
+                        if c2 > cov + 1e-6:
+                            cx, cy, a, b, tilt = params
+                            cov = c2
+                            improved = True
+                            moves += 1
+                            break
+        return cx, cy, a, b, tilt, cov
+
+    cands = []
+    contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    for c in contours:
+        pts = c.reshape(-1, 2).astype(np.float64)
+        if len(pts) < 40:
+            continue
+        try:
+            (ecx, ecy), (d1, d2), eang = cv2.fitEllipse(pts[::2].astype(np.float32))
+        except cv2.error:
+            continue
+        if d1 >= d2:
+            a, b, tilt = d1 / 2.0, d2 / 2.0, float(eang)
+        else:
+            a, b, tilt = d2 / 2.0, d1 / 2.0, float(eang) + 90.0
+        tilt %= 180.0
+        if b < 0.012 * max_dim or a < 0.05 * max_dim or a > 0.8 * max_dim or b / a > 0.92:
+            continue
+        cands.append((float(ecx), float(ecy), a, b, tilt, pts))
+    if not cands:
+        return []
+
+    results = []
+    for cx, cy, a, b, tilt, cpts in cands:
+        w0 = float(np.median(width_profile(cx, cy, a, b, tilt)))
+        seeds = [(cx, cy, a, b, tilt),
+                 (cx, cy, a + w0 / 2.0, b + w0 / 2.0, tilt),
+                 (cx, cy, max(4.0, a - w0 / 2.0), max(4.0, b - w0 / 2.0), tilt)]
+        refined = [refine(*seed) for seed in seeds]
+        cx, cy, a, b, tilt, cov = max(refined, key=lambda r: r[5])
+        tilt %= 180.0
+        if not (0.012 * max_dim <= b and 0.05 * max_dim <= a <= 0.8 * max_dim):
+            continue
+        if b / a > 0.92:
+            continue
+        rmean = 0.5 * (a + b)
+        dx = cpts[:, 0] - cx
+        dy = cpts[:, 1] - cy
+        trr = math.radians(tilt)
+        dxr = dx * math.cos(trr) + dy * math.sin(trr)
+        dyr = -dx * math.sin(trr) + dy * math.cos(trr)
+        phi = np.arctan2(dyr, dxr)
+        r_e = 1.0 / np.sqrt((np.cos(phi) / a) ** 2 + (np.sin(phi) / b) ** 2)
+        err = np.abs(np.hypot(dxr, dyr) - r_e)
+        if float((err <= max(4.0, 0.08 * rmean)).mean()) < 0.8:
+            continue
+        px, py = sample(cx, cy, a, b, tilt, ct, st)
+        hits = dist[py, px] <= 3.0
+        cov_n = float(hits.mean())
+        if cov_n < 0.7 or gap_of(hits) > 0.30:
+            continue
+        if prom_of(cx, cy, a, b, tilt, cov_n, ct, st) < 0.10:
+            continue
+        if dispersion(cx, cy, a, b, tilt) > 0.05:
+            continue
+        wp = width_profile(cx, cy, a, b, tilt)
+        on = wp > 0
+        if float(on.mean()) < 0.55:
+            continue
+        wz = wp[on]
+        if float((np.percentile(wz, 75) - np.percentile(wz, 25))
+                / max(1.0, float(np.median(wz)))) > 0.6:
+            continue
+        results.append((cx, cy, a, b, tilt, cov_n))
+
+    results.sort(key=lambda t: -t[5])
+    kept = []
+    for cx, cy, a, b, tilt, _ in results:
+        rmean = 0.5 * (a + b)
+        dup = False
+        for kx, ky, ka, kb, kt in kept:
+            krk = 0.5 * (ka + kb)
+            if (math.hypot(cx - kx, cy - ky) < max(10.0, 0.05 * krk)
+                    and abs(rmean - krk) < max(6.0, 0.07 * krk)):
+                dup = True
+                break
+        if dup:
+            continue
+        kept.append((cx, cy, a, b, tilt))
+    kept.sort(key=lambda t: -(t[2] * t[3]))
+    return [VectorPath(points=[], closed=True, kind="ellipse",
+                       center=(cx / scale, cy / scale), axis_a=a / scale, axis_b=b / scale,
+                       tilt=tilt)
+            for cx, cy, a, b, tilt in kept]
+
+
 def strip_points_near_circles(paths: list[VectorPath], circles: list[VectorPath], band: float) -> list[VectorPath]:
     if not circles:
         return paths
@@ -678,8 +931,18 @@ def strip_points_near_circles(paths: list[VectorPath], circles: list[VectorPath]
         pts = np.array(p.points, dtype=np.float64)
         keep = np.ones(len(pts), dtype=bool)
         for c in circles:
-            d = np.hypot(pts[:, 0] - c.center[0], pts[:, 1] - c.center[1])
-            keep &= np.abs(d - c.radius) > band
+            if c.kind == "ellipse" and c.axis_a > 0 and c.axis_b > 0:
+                dx = pts[:, 0] - c.center[0]
+                dy = pts[:, 1] - c.center[1]
+                tr = math.radians(c.tilt)
+                u = (dx * math.cos(tr) + dy * math.sin(tr)) / c.axis_a
+                v = (-dx * math.sin(tr) + dy * math.cos(tr)) / c.axis_b
+                q = np.hypot(u, v)
+                rmean = 0.5 * (c.axis_a + c.axis_b)
+                keep &= np.abs((q - 1.0) * rmean) > band
+            else:
+                d = np.hypot(pts[:, 0] - c.center[0], pts[:, 1] - c.center[1])
+                keep &= np.abs(d - c.radius) > band
         if keep.all():
             out.append(p)
             continue
@@ -710,6 +973,17 @@ def curve_points(p: VectorPath, step_deg: float = 5.0) -> list:
         n = max(24, int(360 / step_deg))
         return [(p.center[0] + p.radius * math.cos(math.radians(360 * i / n)),
                  p.center[1] + p.radius * math.sin(math.radians(360 * i / n))) for i in range(n)]
+    if p.kind == "ellipse":
+        n = max(24, int(360 / step_deg))
+        tr = math.radians(p.tilt)
+        ctr, str_ = math.cos(tr), math.sin(tr)
+        pts = []
+        for i in range(n):
+            t = math.radians(360.0 * i / n)
+            ex, ey = p.axis_a * math.cos(t), p.axis_b * math.sin(t)
+            pts.append((p.center[0] + ex * ctr - ey * str_,
+                        p.center[1] + ex * str_ + ey * ctr))
+        return pts
     if p.kind == "arc":
         n = max(4, int(abs(p.sweep) / step_deg))
         return [(p.center[0] + p.radius * math.cos(math.radians(p.start_angle + p.sweep * i / n)),
@@ -950,12 +1224,39 @@ class ImageVectorAgent:
                        abs(c.radius - n.radius) < max(3.0, 0.02 * n.radius) for n in new_circles):
                     continue
                 new_circles.append(c)
-            if new_circles:
-                all_circles = [p for p in paths if p.kind == "circle"] + new_circles
+            ellipses = detect_ellipses(gray, mask, scale, maps=maps)
+            new_ellipses = []
+            for e in ellipses:
+                clash = False
+                for o in [p for p in paths if p.kind in ("circle", "ellipse")] + new_circles:
+                    if o.kind == "circle":
+                        same = (abs(e.axis_a - o.radius) < max(stroke_up / scale, 4.0)
+                                and abs(e.axis_b - o.radius) < max(stroke_up / scale, 4.0))
+                    else:
+                        same = (abs(e.axis_a - o.axis_a) < max(stroke_up / scale, 4.0)
+                                and abs(e.axis_b - o.axis_b) < max(stroke_up / scale, 4.0))
+                    if (math.hypot(e.center[0] - o.center[0], e.center[1] - o.center[1]) < 10
+                            and same):
+                        clash = True
+                        break
+                if clash:
+                    continue
+                ea = sorted((e.axis_a, e.axis_b))
+                if any(math.hypot(e.center[0] - n.center[0], e.center[1] - n.center[1]) < 8
+                       and abs(ea[0] - na) < max(3.0, 0.02 * na)
+                       and abs(ea[1] - nb) < max(3.0, 0.02 * nb)
+                       for n in new_ellipses
+                       for na, nb in [sorted((n.axis_a, n.axis_b))]):
+                    continue
+                new_ellipses.append(e)
+            if new_circles or new_ellipses:
+                all_curves = ([p for p in paths if p.kind in ("circle", "ellipse")]
+                              + new_circles + new_ellipses)
                 band = max(2.5, 0.75 * stroke_up / scale)
-                paths = strip_points_near_circles(paths, all_circles, band) + new_circles
+                paths = strip_points_near_circles(paths, all_curves, band) + new_circles + new_ellipses
         n_circles = sum(1 for p in paths if p.kind == "circle")
         n_arcs = sum(1 for p in paths if p.kind == "arc")
+        n_ellipses = sum(1 for p in paths if p.kind == "ellipse")
 
         stroke_out = self.stroke_width if self.stroke_width is not None else stroke_up / scale
 
@@ -989,6 +1290,7 @@ class ImageVectorAgent:
             "closed_paths": closed_count,
             "circles": n_circles,
             "arcs": n_arcs,
+            "ellipses": n_ellipses,
             "points": sum(len(p.points) for p in paths),
             "outputs": {"svg": str(svg_path), "dxf": str(dxf_path), "preview": str(preview_path),
                          "report": str(outdir / (src.stem + "_report.json"))},
