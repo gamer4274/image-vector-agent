@@ -1234,13 +1234,14 @@ class ImageVectorAgent:
         else:
             paths = extract_outlines(mask, tol, scale)
 
+        if self.fit_curves:
+            paths = detect_curves(paths, tol / scale, max(w0, h0))
         closed_count = sum(1 for p in paths if p.closed)
         if self.close_lines:
             gap = self.gap if self.gap is not None else max(1.5, 0.004 * max(w0, h0))
             paths = close_paths(paths, gap, self.closed_only)
             closed_count = sum(1 for p in paths if p.closed)
         if self.fit_curves:
-            paths = detect_curves(paths, tol / scale, max(w0, h0))
             maps = build_ring_maps(gray)
             verified = []
             for p in paths:
