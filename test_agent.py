@@ -420,6 +420,21 @@ class TestPipelineComplet(unittest.TestCase):
             doc = ezdxf.readfile(report["outputs"]["dxf"])
             self.assertGreaterEqual(
                 sum(1 for e in doc.modelspace() if e.dxftype() == "CIRCLE"), 1)
+    def test_arcs_conserves_avec_lignes_fermees(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "synthetic.jpg"
+            outdir = Path(d) / "out"
+            img = make_canvas(800)
+            cv2.circle(img, (400, 250), 120, BLACK, 3)
+            cv2.ellipse(img, (400, 600), (100, 100), 0, 200.0, 320.0, BLACK, 3)
+            cv2.line(img, (80, 700), (220, 700), BLACK, 2)
+            cv2.imwrite(str(src), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            agent = ImageVectorAgent(quality="high", close_lines=True)
+            report = agent.run(src, outdir)
+            self.assertGreaterEqual(report["arcs"], 1)
+            doc = ezdxf.readfile(report["outputs"]["dxf"])
+            self.assertGreaterEqual(
+                sum(1 for e in doc.modelspace() if e.dxftype() == "ARC"), 1)
 
 
 if __name__ == "__main__":
