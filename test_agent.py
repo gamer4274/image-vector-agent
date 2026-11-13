@@ -300,6 +300,49 @@ class TestStripPointsNearCircles(unittest.TestCase):
         self.assertEqual(len(res), 1)
         self.assertEqual(res[0].points, loin)
 
+    def test_trait_arrivant_sur_cercle_conserve_et_raccourci(self):
+        cercle = VectorPath(points=[], closed=True, kind="circle", center=(200.0, 200.0), radius=100.0)
+        trait = VectorPath(points=[(200.0, 296.0), (200.0, 330.0)], closed=False)
+        res = strip_points_near_circles([trait], [cercle], 5.0)
+        self.assertEqual(len(res), 1)
+        pts = res[0].points
+        self.assertEqual(len(pts), 2)
+        self.assertAlmostEqual(pts[1][0], 200.0, places=1)
+        self.assertAlmostEqual(pts[1][1], 330.0, places=1)
+        d0 = math.hypot(pts[0][0] - 200.0, pts[0][1] - 200.0)
+        self.assertAlmostEqual(d0, 105.0, delta=0.6)
+
+    def test_trait_entierement_dans_le_bandeau_supprime(self):
+        cercle = VectorPath(points=[], closed=True, kind="circle", center=(200.0, 200.0), radius=100.0)
+        trait = VectorPath(points=[(200.0, 298.0), (200.0, 302.0)], closed=False)
+        res = strip_points_near_circles([trait], [cercle], 5.0)
+        self.assertEqual(len(res), 0)
+
+    def test_trait_traversant_le_cercle_coupe_aux_deux_bords(self):
+        cercle = VectorPath(points=[], closed=True, kind="circle", center=(200.0, 200.0), radius=100.0)
+        trait = VectorPath(points=[(200.0, 150.0), (200.0, 298.0), (200.0, 320.0)], closed=False)
+        res = strip_points_near_circles([trait], [cercle], 5.0)
+        self.assertEqual(len(res), 2)
+        for seg in res:
+            self.assertEqual(len(seg.points), 2)
+        ys = sorted(pt[1] for seg in res for pt in seg.points)
+        self.assertAlmostEqual(ys[0], 150.0, places=1)
+        self.assertAlmostEqual(ys[1], 295.0, delta=0.6)
+        self.assertAlmostEqual(ys[2], 305.0, delta=0.6)
+        self.assertAlmostEqual(ys[3], 320.0, places=1)
+
+    def test_trait_arrivant_sur_ellipse_conserve(self):
+        ell = VectorPath(points=[], closed=True, kind="ellipse",
+                         center=(200.0, 200.0), axis_a=120.0, axis_b=60.0, tilt=0.0)
+        trait = VectorPath(points=[(320.0, 200.0), (360.0, 200.0)], closed=False)
+        res = strip_points_near_circles([trait], [ell], 5.0)
+        self.assertEqual(len(res), 1)
+        pts = res[0].points
+        self.assertEqual(len(pts), 2)
+        self.assertAlmostEqual(pts[1][0], 360.0, places=1)
+        d0 = math.hypot(pts[0][0] - 200.0, pts[0][1] - 200.0)
+        self.assertAlmostEqual(d0, 126.67, delta=0.6)
+
 
 class TestExports(unittest.TestCase):
     def test_write_svg_cercle(self):

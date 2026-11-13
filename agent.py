@@ -920,6 +920,34 @@ def detect_ellipses(gray: np.ndarray, mask: np.ndarray, scale: float,
             for cx, cy, a, b, tilt in kept]
 
 
+def _gap_to_curve(curve: VectorPath, pt) -> float:
+    dx = pt[0] - curve.center[0]
+    dy = pt[1] - curve.center[1]
+    if curve.kind == "ellipse" and curve.axis_a > 0 and curve.axis_b > 0:
+        tr = math.radians(curve.tilt)
+        u = (dx * math.cos(tr) + dy * math.sin(tr)) / curve.axis_a
+        v = (-dx * math.sin(tr) + dy * math.cos(tr)) / curve.axis_b
+        return abs((math.hypot(u, v) - 1.0) * 0.5 * (curve.axis_a + curve.axis_b))
+    return abs(math.hypot(dx, dy) - curve.radius)
+
+
+def _clip_to_band(p_keep, p_drop, circles: list[VectorPath], band: float):
+    a = np.asarray(p_keep, dtype=np.float64)
+    b = np.asarray(p_drop, dtype=np.float64)
+    lo, hi = 0.0, 1.0
+    for _ in range(20):
+        mid = 0.5 * (lo + hi)
+        pt = a + (b - a) * mid
+        if min(_gap_to_curve(c, pt) for c in circles) <= band:
+            hi = mid
+        else:
+            lo = mid
+    if lo <= 0.0:
+        return None
+    pt = a + (b - a) * lo
+    return (float(pt[0]), float(pt[1]))
+
+
 def strip_points_near_circles(paths: list[VectorPath], circles: list[VectorPath], band: float) -> list[VectorPath]:
     if not circles:
         return paths
@@ -929,7 +957,8 @@ def strip_points_near_circles(paths: list[VectorPath], circles: list[VectorPath]
             out.append(p)
             continue
         pts = np.array(p.points, dtype=np.float64)
-        keep = np.ones(len(pts), dtype=bool)
+        n = len(pts)
+        keep = np.ones(n, dtype=bool)
         for c in circles:
             if c.kind == "ellipse" and c.axis_a > 0 and c.axis_b > 0:
                 dx = pts[:, 0] - c.center[0]
@@ -947,7 +976,7 @@ def strip_points_near_circles(paths: list[VectorPath], circles: list[VectorPath]
             out.append(p)
             continue
         idx = np.nonzero(keep)[0]
-        if len(idx) < 2:
+        if len(idx) == 0:
             continue
         segs = []
         cur = [int(idx[0])]
@@ -958,11 +987,22 @@ def strip_points_near_circles(paths: list[VectorPath], circles: list[VectorPath]
                 segs.append(cur)
                 cur = [int(i)]
         segs.append(cur)
-        if p.closed and len(segs) > 1 and 0 in segs[0] and (len(pts) - 1) in segs[-1]:
+        if p.closed and len(segs) > 1 and 0 in segs[0] and (n - 1) in segs[-1]:
             segs[0] = segs[-1] + segs[0]
             segs.pop()
         for seg in segs:
-            seg_pts = [(round(float(pts[i][0]), 2), round(float(pts[i][1]), 2)) for i in seg]
+            first, last = seg[0], seg[-1]
+            head = tail = None
+            prev_i = first - 1 if first > 0 else (n - 1 if p.closed else None)
+            if prev_i is not None and not keep[prev_i]:
+                head = _clip_to_band(pts[first], pts[prev_i], circles, band)
+            next_i = last + 1 if last < n - 1 else (0 if p.closed else None)
+            if next_i is not None and not keep[next_i]:
+                tail = _clip_to_band(pts[last], pts[next_i], circles, band)
+            seg_pts = [head] if head else []
+            seg_pts += [(round(float(pts[i][0]), 2), round(float(pts[i][1]), 2)) for i in seg]
+            if tail:
+                seg_pts.append(tail)
             if len(seg_pts) >= 2:
                 out.append(VectorPath(points=seg_pts, closed=False))
     return out
