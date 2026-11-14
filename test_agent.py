@@ -18,6 +18,7 @@ import numpy as np
 
 from agent import (
     QUALITY_TOLERANCE,
+    _drop_gradient_edges,
     ImageVectorAgent,
     VectorPath,
     binarize,
@@ -29,6 +30,7 @@ from agent import (
     detect_rings,
     load_image,
     preprocess,
+    remove_ring_shading,
     remove_specks,
     ring_scores,
     strip_points_near_circles,
@@ -342,6 +344,67 @@ class TestStripPointsNearCircles(unittest.TestCase):
         self.assertAlmostEqual(pts[1][0], 360.0, places=1)
         d0 = math.hypot(pts[0][0] - 200.0, pts[0][1] - 200.0)
         self.assertAlmostEqual(d0, 126.67, delta=0.6)
+
+
+class TestRemoveRingShading(unittest.TestCase):
+    def test_doublon_arc_supprime(self):
+        cercle = VectorPath(points=[], closed=True, kind="circle", center=(200.0, 200.0), radius=100.0)
+        th = np.linspace(math.radians(10), math.radians(120), 30)
+        arc = VectorPath(
+            points=[(200.0 + 100.0 * math.cos(t), 200.0 + 100.0 * math.sin(t)) for t in th],
+            closed=False, kind="arc", center=(200.0, 200.0), radius=100.0,
+            start_angle=10.0, sweep=110.0)
+        res = remove_ring_shading([arc], [cercle], 4.0, 0.8)
+        self.assertEqual(len(res), 0)
+
+    def test_ombrage_bossule_supprime(self):
+        cercle = VectorPath(points=[], closed=True, kind="circle", center=(200.0, 200.0), radius=100.0)
+        th = np.linspace(0.0, 2.0 * np.pi, 40, endpoint=False)
+        wob = [(200.0 + (105.0 + 3.0 * math.sin(5.0 * t)) * math.cos(t),
+                200.0 + (105.0 + 3.0 * math.sin(5.0 * t)) * math.sin(t)) for t in th]
+        res = remove_ring_shading([VectorPath(points=wob, closed=False)], [cercle], 4.0, 0.8)
+        self.assertEqual(len(res), 0)
+
+    def test_arc_distinct_conserve(self):
+        cercle = VectorPath(points=[], closed=True, kind="circle", center=(200.0, 200.0), radius=100.0)
+        th = np.linspace(math.radians(10), math.radians(120), 30)
+        arc = VectorPath(
+            points=[(200.0 + 60.0 * math.cos(t), 200.0 + 60.0 * math.sin(t)) for t in th],
+            closed=False, kind="arc", center=(200.0, 200.0), radius=60.0,
+            start_angle=10.0, sweep=110.0)
+        res = remove_ring_shading([arc], [cercle], 4.0, 0.8)
+        self.assertEqual(len(res), 1)
+
+    def test_trait_traversant_conserve(self):
+        cercle = VectorPath(points=[], closed=True, kind="circle", center=(200.0, 200.0), radius=100.0)
+        ligne = VectorPath(points=[(0.0, 200.0), (400.0, 200.0)], closed=False)
+        res = remove_ring_shading([ligne], [cercle], 4.0, 0.8)
+        self.assertEqual(len(res), 1)
+
+
+class TestFiltreDegrades(unittest.TestCase):
+    def test_marche_faible_lointaine_supprimee(self):
+        smooth = np.full((60, 60), 100, dtype=np.uint8)
+        smooth[:, :30] = 30
+        smooth[:, 30:] = 200
+        smooth[50:60, 35:55] = 180
+        edges = np.zeros((60, 60), np.uint8)
+        edges[10:45, 30] = 255
+        edges[50, 35:55] = 255
+        res = _drop_gradient_edges(edges, smooth)
+        self.assertGreaterEqual((res[10:45, 30] > 0).sum(), 30)
+        self.assertEqual((res[50, 35:55] > 0).sum(), 0)
+
+    def test_marche_faible_raccordee_conservee(self):
+        smooth = np.full((60, 60), 100, dtype=np.uint8)
+        smooth[:, :30] = 30
+        smooth[:30, 30:] = 200
+        smooth[30:, 30:] = 60
+        edges = np.zeros((60, 60), np.uint8)
+        edges[10:40, 30] = 255
+        res = _drop_gradient_edges(edges, smooth)
+        self.assertGreaterEqual((res[10:31, 30] > 0).sum(), 20)
+        self.assertEqual((res[33:40, 30] > 0).sum(), 0)
 
 
 class TestExports(unittest.TestCase):
