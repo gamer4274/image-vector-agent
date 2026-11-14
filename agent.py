@@ -28,6 +28,13 @@ MAX_UPSCALE = 4.0
 
 INSUNITS = {"px": 0, "in": 1, "mm": 4, "cm": 5}
 
+COLOR_NAMES = ("bleu", "blanc", "rouge", "vert", "jaune", "noir")
+COLOR_HEX = {"bleu": "#1f6fd0", "blanc": "#e0e0e0", "rouge": "#d62728",
+             "vert": "#2ca02c", "jaune": "#e8b923", "noir": "#1a1a1a"}
+COLOR_ACI = {"bleu": 5, "blanc": 7, "rouge": 1, "vert": 3, "jaune": 2, "noir": 7}
+COLOR_BGR = {name: (int(hx[5:7], 16), int(hx[3:5], 16), int(hx[1:3], 16))
+             for name, hx in COLOR_HEX.items()}
+
 
 @dataclass
 class Analysis:
@@ -56,6 +63,7 @@ class VectorPath:
     axis_a: float = 0.0
     axis_b: float = 0.0
     tilt: float = 0.0
+    color: str = ""
 
 
 def load_image(path: Path) -> np.ndarray:
@@ -113,6 +121,42 @@ def remove_specks(mask: np.ndarray, min_area_frac: float = 2e-5) -> np.ndarray:
         if stats[i, cv2.CC_STAT_AREA] >= min_area:
             out[labels == i] = 255
     return out
+
+
+def quantize_colors(bgr: np.ndarray) -> np.ndarray:
+    """Classe chaque pixel dans une des 6 categories de COLOR_NAMES.
+
+    Retourne une carte d'indices (HxW, uint8) : 0=bleu, 1=blanc, 2=rouge,
+    3=vert, 4=jaune, 5=noir. Regles HSV : V bas -> noir, S bas -> blanc
+    (ou noir si V bas), sinon teinte dominante (rouge / jaune / vert / bleu).
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[..., 0].astype(np.int16), hsv[..., 1].astype(np.int16), hsv[..., 2].astype(np.int16)
+    labels = np.full(h.shape, COLOR_NAMES.index("blanc"), dtype=np.uint8)
+    labels[v < 70] = COLOR_NAMES.index("noir")
+    gray = (s < 45) & (v >= 70)
+    labels[gray & (v < 128)] = COLOR_NAMES.index("noir")
+    colored = s >= 45
+    red = colored & ((h < 22) | (h >= 140))
+    yellow = colored & (h >= 22) & (h < 38)
+    green = colored & (h >= 38) & (h < 85)
+    blue = colored & (h >= 85) & (h < 140)
+    labels[red] = COLOR_NAMES.index("rouge")
+    labels[yellow] = COLOR_NAMES.index("jaune")
+    labels[green] = COLOR_NAMES.index("vert")
+    labels[blue] = COLOR_NAMES.index("bleu")
+    return labels
+
+
+def dominant_color(labels: np.ndarray, pts) -> str:
+    """Couleur majoritaire (vote) aux coordonnees des points d'un trace."""
+    if not pts:
+        return ""
+    h, w = labels.shape[:2]
+    xs = np.array([min(max(int(round(p[0])), 0), w - 1) for p in pts], dtype=np.int64)
+    ys = np.array([min(max(int(round(p[1])), 0), h - 1) for p in pts], dtype=np.int64)
+    votes = labels[ys, xs]
+    return COLOR_NAMES[int(np.bincount(votes, minlength=len(COLOR_NAMES)).argmax())]
 
 
 def estimate_stroke_width(mask: np.ndarray) -> float:
@@ -254,8 +298,9 @@ def extract_edges(gray: np.ndarray, tolerance: float, scale: float) -> list[Vect
     return prune_and_simplify(trace_skeleton(skel), tolerance, scale)
 
 
-def extract_outlines(mask: np.ndarray, tolerance: float, scale: float) -> list[VectorPath]:
-    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+def extract_outlines(mask: np.ndarray, tolerance: float, scale: float, external: bool = False) -> list[VectorPath]:
+    mode = cv2.RETR_EXTERNAL if external else cv2.RETR_LIST
+    contours, _ = cv2.findContours(mask, mode, cv2.CHAIN_APPROX_NONE)
     h, w = mask.shape
     min_area = max(8.0, 5e-5 * h * w)
     min_perimeter = max(24.0, 0.03 * max(h, w))
@@ -274,33 +319,38 @@ def extract_outlines(mask: np.ndarray, tolerance: float, scale: float) -> list[V
 
 def write_svg(paths: list[VectorPath], width: int, height: int, stroke_width: float, out: Path) -> None:
     w = max(0.25, min(6.0, stroke_width))
+    colored = any(p.color for p in paths)
     lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
-        f'  <g fill="none" stroke="#000000" stroke-width="{w:.2f}" stroke-linecap="round" stroke-linejoin="round">',
     ]
+    if colored:
+        lines.append('  <rect width="100%" height="100%" fill="#fafafa"/>')
+    lines.append(
+        f'  <g fill="none" stroke="#000000" stroke-width="{w:.2f}" stroke-linecap="round" stroke-linejoin="round">')
     for p in paths:
+        stroke = f' stroke="{COLOR_HEX[p.color]}"' if p.color else ""
         if p.kind == "circle":
             cx, cy = p.center
-            lines.append(f'    <circle cx="{cx:.2f}" cy="{cy:.2f}" r="{p.radius:.2f}"/>')
+            lines.append(f'    <circle cx="{cx:.2f}" cy="{cy:.2f}" r="{p.radius:.2f}"{stroke}/>')
             continue
         if p.kind == "ellipse":
             cx, cy = p.center
             lines.append(f'    <ellipse cx="{cx:.2f}" cy="{cy:.2f}" rx="{p.axis_a:.2f}" ry="{p.axis_b:.2f}" '
-                         f'transform="rotate({p.tilt:.2f} {cx:.2f} {cy:.2f})"/>')
+                         f'transform="rotate({p.tilt:.2f} {cx:.2f} {cy:.2f})"{stroke}/>')
             continue
         if p.kind == "arc":
             pts = curve_points(p)
             (sx, sy), (ex, ey) = pts[0], pts[-1]
             large = 1 if abs(p.sweep) > 180 else 0
             sweep_flag = 1 if p.sweep > 0 else 0
-            lines.append(f'    <path d="M {sx:.2f} {sy:.2f} A {p.radius:.2f} {p.radius:.2f} 0 {large} {sweep_flag} {ex:.2f} {ey:.2f}"/>')
+            lines.append(f'    <path d="M {sx:.2f} {sy:.2f} A {p.radius:.2f} {p.radius:.2f} 0 {large} {sweep_flag} {ex:.2f} {ey:.2f}"{stroke}/>')
             continue
         d = f"M {p.points[0][0]} {p.points[0][1]}"
         for x, y in p.points[1:]:
             d += f" L {x} {y}"
         if p.closed:
             d += " Z"
-        lines.append(f"    <path d=\"{d}\"/>")
+        lines.append(f'    <path d="{d}"{stroke}/>')
     lines.append("  </g>")
     lines.append("</svg>")
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -311,19 +361,22 @@ def write_dxf(paths: list[VectorPath], height: int, unit: str, user_scale: float
     doc.header["$INSUNITS"] = INSUNITS.get(unit, 0)
     doc.header["$MEASUREMENT"] = 1 if unit in ("mm", "cm") else 0
     doc.layers.add("TRACE", color=7)
+    for name in dict.fromkeys(p.color for p in paths if p.color):
+        doc.layers.add(f"COL_{name.upper()}", color=COLOR_ACI.get(name, 7))
     msp = doc.modelspace()
     k = user_scale
     for p in paths:
+        layer = f"COL_{p.color.upper()}" if p.color else "TRACE"
         if p.kind == "circle":
             cx, cy = p.center
-            msp.add_circle((cx * k, (height - cy) * k), p.radius * k, dxfattribs={"layer": "TRACE"})
+            msp.add_circle((cx * k, (height - cy) * k), p.radius * k, dxfattribs={"layer": layer})
             continue
         if p.kind == "ellipse":
             cx, cy = p.center
             tr = math.radians(p.tilt)
             major = (p.axis_a * math.cos(tr) * k, -p.axis_a * math.sin(tr) * k)
             ratio = p.axis_b / p.axis_a if p.axis_a > 0 else 1.0
-            msp.add_ellipse((cx * k, (height - cy) * k), major, ratio, dxfattribs={"layer": "TRACE"})
+            msp.add_ellipse((cx * k, (height - cy) * k), major, ratio, dxfattribs={"layer": layer})
             continue
         if p.kind == "arc":
             cx, cy = p.center
@@ -333,18 +386,20 @@ def write_dxf(paths: list[VectorPath], height: int, unit: str, user_scale: float
                 start, end = a0, (a0 + sweep_d) % 360.0
             else:
                 start, end = (a0 + sweep_d) % 360.0, a0
-            msp.add_arc((cx * k, (height - cy) * k), p.radius * k, start, end, dxfattribs={"layer": "TRACE"})
+            msp.add_arc((cx * k, (height - cy) * k), p.radius * k, start, end, dxfattribs={"layer": layer})
             continue
         pts = [(x * k, (height - y) * k) for x, y in p.points]
-        msp.add_lwpolyline(pts, format="xy", close=p.closed, dxfattribs={"layer": "TRACE"})
+        msp.add_lwpolyline(pts, format="xy", close=p.closed, dxfattribs={"layer": layer})
     doc.saveas(out)
 
 
 def write_preview(paths: list[VectorPath], width: int, height: int, out: Path) -> None:
     canvas = np.full((height, width, 3), 255, dtype=np.uint8)
+    if any(p.color for p in paths):
+        canvas[:] = (250, 250, 250)
     for p in paths:
         pts = np.array([[int(round(x)), int(round(y))] for x, y in curve_points(p)], dtype=np.int32)
-        cv2.polylines(canvas, [pts], p.closed or p.kind == "circle", (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.polylines(canvas, [pts], p.closed or p.kind == "circle", COLOR_BGR.get(p.color, (0, 0, 0)), 1, cv2.LINE_AA)
     cv2.imwrite(str(out), canvas)
 
 
@@ -384,10 +439,10 @@ def detect_curves(paths: list[VectorPath], tol: float, max_dim: float) -> list[V
             result.append(p)
             continue
         if abs(sweep) >= 320.0:
-            result.append(VectorPath(points=[], closed=True, kind="circle", center=(cx, cy), radius=r))
+            result.append(VectorPath(points=[], closed=True, kind="circle", center=(cx, cy), radius=r, color=p.color))
         elif 25.0 <= abs(sweep) <= 330.0:
             result.append(VectorPath(points=[], closed=False, kind="arc", center=(cx, cy), radius=r,
-                                     start_angle=float(ang[0]) % 360.0, sweep=sweep))
+                                     start_angle=float(ang[0]) % 360.0, sweep=sweep, color=p.color))
         else:
             result.append(p)
     return result
@@ -1030,7 +1085,7 @@ def strip_points_near_circles(paths: list[VectorPath], circles: list[VectorPath]
             if tail:
                 seg_pts.append(tail)
             if len(seg_pts) >= 2:
-                out.append(VectorPath(points=seg_pts, closed=False))
+                out.append(VectorPath(points=seg_pts, closed=False, color=p.color))
     return out
 
 
@@ -1105,7 +1160,7 @@ def close_paths(paths: list[VectorPath], gap: float, closed_only: bool) -> list[
 
     chains = {}
     for i, p in enumerate(opens):
-        chains[i] = {"pts": list(p.points), "e_start": (i, 0), "e_end": (i, 1), "closed": False}
+        chains[i] = {"pts": list(p.points), "e_start": (i, 0), "e_end": (i, 1), "closed": False, "color": p.color}
     end_chain = {}
     for i in chains:
         end_chain[(i, 0)] = i
@@ -1165,7 +1220,8 @@ def close_paths(paths: list[VectorPath], gap: float, closed_only: bool) -> list[
                 continue
             pa, other_a = oriented(A, ea)
             pb, other_b = oriented(B, eb)
-            merged = {"pts": pa[::-1] + pb, "e_start": other_a, "e_end": other_b, "closed": False}
+            merged = {"pts": pa[::-1] + pb, "e_start": other_a, "e_end": other_b, "closed": False,
+                      "color": A["color"] or B["color"]}
             del chains[ca], chains[cb]
             end_chain.pop(ea, None)
             end_chain.pop(eb, None)
@@ -1208,7 +1264,8 @@ def close_paths(paths: list[VectorPath], gap: float, closed_only: bool) -> list[
         A, B = chains[cid_a], chains[cid_b]
         pa, other_a = oriented(A, ea)
         pb, other_b = oriented(B, eb)
-        merged = {"pts": pa[::-1] + pb, "e_start": other_a, "e_end": other_b, "closed": False}
+        merged = {"pts": pa[::-1] + pb, "e_start": other_a, "e_end": other_b, "closed": False,
+                  "color": A["color"] or B["color"]}
         del chains[cid_a], chains[cid_b]
         end_chain.pop(ea, None)
         end_chain.pop(eb, None)
@@ -1224,7 +1281,7 @@ def close_paths(paths: list[VectorPath], gap: float, closed_only: bool) -> list[
 
     for c in chains.values():
         if c["closed"] or not closed_only:
-            result.append(VectorPath(points=c["pts"], closed=c["closed"]))
+            result.append(VectorPath(points=c["pts"], closed=c["closed"], color=c.get("color", "")))
     return result
 
 
@@ -1233,7 +1290,7 @@ class ImageVectorAgent:
                  threshold: str = "auto", invert: bool = False, unit: str = "px", scale: float = 1.0,
                  min_area_frac: float = 2e-5, close_lines: bool = False, closed_only: bool = False,
                  gap: float | None = None, stroke_width: float | None = None,
-                 fit_curves: bool = True):
+                 fit_curves: bool = True, colors: str = "none"):
         self.mode = mode
         self.quality = quality
         self.tolerance = tolerance
@@ -1247,6 +1304,23 @@ class ImageVectorAgent:
         self.gap = gap
         self.stroke_width = stroke_width
         self.fit_curves = fit_curves
+        self.colors = self._parse_colors(colors)
+
+    @staticmethod
+    def _parse_colors(colors: str | None) -> list[str] | None:
+        if not colors:
+            return None
+        key = colors.strip().lower().replace("_", ",").replace(" ", ",")
+        if key in ("", "none", "aucune", "aucun", "gris"):
+            return None
+        if key in ("all", "toutes", "tous"):
+            return list(COLOR_NAMES)
+        picked = [c.strip().lower() for c in key.replace(";", ",").split(",") if c.strip()]
+        unknown = [c for c in picked if c not in COLOR_NAMES]
+        if unknown:
+            raise ValueError(f"Couleur inconnue : {', '.join(unknown)}. "
+                             f"Choix possibles : {', '.join(COLOR_NAMES)} ou 'toutes'.")
+        return list(dict.fromkeys(picked))
 
     def run(self, src: Path, outdir: Path) -> dict:
         outdir.mkdir(parents=True, exist_ok=True)
@@ -1266,32 +1340,73 @@ class ImageVectorAgent:
             if float(border.mean()) < 110.0:
                 invert = True
                 polarity = "clair"
-        mask, tmethod = binarize(gray, self.threshold, invert)
-        mask = remove_specks(mask, self.min_area_frac)
+
+        labels = None
+        present = {}
+        selected = []
+        if self.colors:
+            labels = quantize_colors(img)
+            present = {name: float((labels == i).mean()) for i, name in enumerate(COLOR_NAMES)}
+            selected = [n for n in self.colors if present[n] >= 0.003]
+            if not selected:
+                raise ValueError("Aucune des couleurs demandées n'est assez présente dans l'image "
+                                 f"(seuil 0,3 % de la surface). Demande : {', '.join(self.colors)}.")
+            invert = True
+            polarity = "couleurs"
+            tmethod = "quantification HSV"
+            h_up, w_up = gray.shape
+            mask = np.zeros(gray.shape, dtype=np.uint8)
+            cat_masks = {}
+            for name in selected:
+                m_up = cv2.resize((labels == COLOR_NAMES.index(name)).astype(np.uint8) * 255,
+                                  (w_up, h_up), interpolation=cv2.INTER_NEAREST)
+                m_up = remove_specks(m_up, self.min_area_frac)
+                m_up = cv2.medianBlur(m_up, 3)
+                cat_masks[name] = m_up
+                mask |= m_up
+            mask_bin, _ = binarize(gray, self.threshold, invert)
+            mask_bin = remove_specks(mask_bin, self.min_area_frac)
+        else:
+            mask, tmethod = binarize(gray, self.threshold, invert)
+            mask = remove_specks(mask, self.min_area_frac)
         ink_fraction = float(np.count_nonzero(mask)) / mask.size
         if ink_fraction < 0.0005:
             raise ValueError("Aucun tracé détecté : image quasi vide ou paramètres inadaptés.")
 
-        stroke_up = estimate_stroke_width(mask)
+        if labels is not None:
+            bnd = cv2.subtract(mask, cv2.erode(mask, np.ones((3, 3), np.uint8)))
+            stroke_up = estimate_stroke_width(bnd) / 2.0
+            mask_cao = mask_bin
+        else:
+            stroke_up = estimate_stroke_width(mask)
+            mask_cao = mask
         if self.tolerance is not None:
             tol = self.tolerance * scale
         else:
             tol = QUALITY_TOLERANCE[self.quality] * scale
 
         mode = self.mode
-        if mode == "auto":
-            mode = "centerline" if ink_fraction < 0.35 else "outline"
-
-        if mode == "centerline":
-            skel = skeletonize(mask > 0).astype(np.uint8) * 255
-            paths = prune_and_simplify(trace_skeleton(skel), tol, scale)
-            if len(paths) > 1.5 * max(w0, h0):
-                mode = "edges"
-                paths = extract_edges(gray, tol, scale)
-        elif mode == "edges":
-            paths = extract_edges(gray, tol, scale)
+        if labels is not None:
+            mode = "couleurs"
+            paths = []
+            for name in selected:
+                for p in extract_outlines(cat_masks[name], tol, scale, external=True):
+                    p.color = name
+                    paths.append(p)
         else:
-            paths = extract_outlines(mask, tol, scale)
+            if mode == "auto":
+                mode = "centerline" if ink_fraction < 0.35 else "outline"
+
+            if mode == "centerline":
+                skel = skeletonize(mask > 0).astype(np.uint8) * 255
+                paths = prune_and_simplify(trace_skeleton(skel), tol, scale)
+                if len(paths) > 1.5 * max(w0, h0):
+                    mode = "edges"
+                    paths = extract_edges(gray, tol, scale)
+            elif mode == "edges":
+                paths = extract_edges(gray, tol, scale)
+            else:
+                paths = extract_outlines(mask, tol, scale)
 
         if self.fit_curves:
             paths = detect_curves(paths, tol / scale, max(w0, h0))
@@ -1309,10 +1424,10 @@ class ImageVectorAgent:
                                                             p.center[0] * scale, p.center[1] * scale,
                                                             p.radius * scale)
                     if not ((cov_n >= 0.7 or cov_c >= 0.55) and gap_n <= 0.3 and step >= 30.0):
-                        p = VectorPath(points=curve_points(p), closed=True)
+                        p = VectorPath(points=curve_points(p), closed=True, color=p.color)
                 verified.append(p)
             paths = verified
-            ring_circles = detect_rings(gray, mask, scale, maps=maps)
+            ring_circles = detect_rings(gray, mask_cao, scale, maps=maps)
             existing = [p for p in paths if p.kind == "circle"
                         or (p.kind == "arc" and abs(p.sweep) >= 180.0)]
             new_circles = []
@@ -1324,7 +1439,7 @@ class ImageVectorAgent:
                        abs(c.radius - n.radius) < max(3.0, 0.02 * n.radius) for n in new_circles):
                     continue
                 new_circles.append(c)
-            ellipses = detect_ellipses(gray, mask, scale, maps=maps)
+            ellipses = detect_ellipses(gray, mask_cao, scale, maps=maps)
             new_ellipses = []
             for e in ellipses:
                 clash = False
@@ -1357,6 +1472,14 @@ class ImageVectorAgent:
                 paths = remove_ring_shading(paths,
                                             [c for c in all_curves if c.kind == "circle"],
                                             band, tol / scale)
+        if labels is not None:
+            kept = []
+            for p in paths:
+                if not p.color:
+                    p.color = dominant_color(labels, curve_points(p))
+                if p.color in selected:
+                    kept.append(p)
+            paths = kept
         n_circles = sum(1 for p in paths if p.kind == "circle")
         n_arcs = sum(1 for p in paths if p.kind == "arc")
         n_ellipses = sum(1 for p in paths if p.kind == "ellipse")
@@ -1388,12 +1511,14 @@ class ImageVectorAgent:
             "parameters": {"mode": self.mode, "mode_effectif": mode, "quality": self.quality,
                            "tolerance_px": round(tol / scale, 3),
                            "threshold": self.threshold, "invert": invert, "unit": self.unit, "scale": self.scale,
-                           "close_lines": self.close_lines, "closed_only": self.closed_only, "gap_px": self.gap},
+                           "close_lines": self.close_lines, "closed_only": self.closed_only, "gap_px": self.gap,
+                           "colors": self.colors if self.colors else "none"},
             "paths": len(paths),
             "closed_paths": closed_count,
             "circles": n_circles,
             "arcs": n_arcs,
             "ellipses": n_ellipses,
+            "colors": present,
             "points": sum(len(p.points) for p in paths),
             "outputs": {"svg": str(svg_path), "dxf": str(dxf_path), "preview": str(preview_path),
                          "report": str(outdir / (src.stem + "_report.json"))},
@@ -1419,13 +1544,15 @@ def main(argv=None) -> int:
     ap.add_argument("--gap", type=float, default=None, help="Distance max de raccord des extrémités en px (défaut auto)")
     ap.add_argument("--stroke-width", type=float, default=None, help="Épaisseur du trait SVG en px (défaut : estimation auto)")
     ap.add_argument("--no-curves", action="store_true", help="Désactiver la détection de cercles/arcs parfaits")
+    ap.add_argument("--colors", default="none",
+                    help="Couleurs à tracer, séparées par des virgules (bleu, blanc, rouge, vert, jaune, noir) ou 'toutes' ; défaut : aucune")
     args = ap.parse_args(argv)
 
     agent = ImageVectorAgent(mode=args.mode, quality=args.quality, tolerance=args.tolerance,
                              threshold=args.threshold, invert=args.invert, unit=args.unit, scale=args.scale,
                              min_area_frac=args.min_area, close_lines=args.close,
                              closed_only=args.closed_only, gap=args.gap, stroke_width=args.stroke_width,
-                             fit_curves=not args.no_curves)
+                             fit_curves=not args.no_curves, colors=args.colors)
     try:
         report = agent.run(args.image, args.outdir)
     except (ValueError, FileNotFoundError) as e:

@@ -63,6 +63,7 @@ python agent.py plan.jpg -o sortie/ --threshold adaptive --min-area 1e-5
 | `--gap` | float | Distance max de raccord des extrémités en px (défaut auto : max(1,5 px ; 0,4 % de la taille)) |
 | `--stroke-width` | float | Épaisseur du trait SVG en px (défaut : estimation automatique) |
 | `--no-curves` | flag | Désactive la détection de cercles/arcs parfaits |
+| `--colors` | liste ou `toutes` | Trace en couleurs : quantification en 6 catégories (bleu, blanc, rouge, vert, jaune, noir), séparées par des virgules (défaut : aucune) |
 
 ## Gravure laser
 
@@ -77,6 +78,25 @@ python agent.py logo.jpg -o sortie/ --mode edges --close --unit mm --scale 0.1
 - ajustez `--gap` si des boucles ne se ferment pas (augmenter) ou si des zones distinctes se recollent (diminuer).
 
 Dans l'interface web, la case « Tracés fermés (gravure / découpe laser) » active `--close` sans suppression.
+
+## Couleurs
+
+Par défaut le tracé est monochrome (toutes les formes en noir). L'option `--colors` active
+le tracé en couleurs : l'image est d'abord quantifiée en 6 catégories simples
+(bleu, blanc, rouge, vert, jaune, noir) selon des règles HSV (luminosité, saturation,
+teinte), puis chaque catégorie est tracée séparément — les dégradés sont donc aplatis
+vers leur catégorie dominante, ce qui simplifie le tracé avant extraction.
+
+```bash
+python agent.py logo.jpg -o sortie/ --colors rouge,jaune
+python agent.py logo.jpg -o sortie/ --colors toutes
+```
+
+- sélection des couleurs à traiter : une catégorie absente ou quasi absente (< 0,3 % de la surface) est ignorée ; une erreur liste les choix valides si le nom est inconnu ;
+- les cercles, arcs et ellipses détectés prennent la couleur majoritaire de leur emplacement ;
+- le SVG utilise une couleur de trait par forme (fond clair `#fafafa`, blanc rendu `#e0e0e0` pour rester visible) ;
+- le DXF range chaque couleur dans un calque dédié `COL_BLEU`, `COL_ROUGE`, … avec la couleur AutoCAD correspondante ;
+- dans l'interface web, le champ « Couleurs à tracer » accepte la même syntaxe (vide = monochrome).
 
 ## Qualité
 
