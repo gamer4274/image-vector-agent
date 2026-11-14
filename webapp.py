@@ -11,7 +11,7 @@ import re
 import uuid
 from pathlib import Path
 
-from flask import Flask, abort, redirect, render_template_string, request, send_file, url_for
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, url_for
 
 from agent import ImageVectorAgent
 
@@ -49,6 +49,14 @@ HEAD = """<!doctype html>
          text-decoration: none; border-radius: 8px; background: #1a73e8; color: #fff; }
   .btn.secondary { background: #e8eaed; color: #1a1a1a; }
   a.back { display: inline-block; margin-top: 1.5rem; color: #1a73e8; }
+  .curseurs { display: grid; grid-template-columns: 1fr 1fr; gap: .4rem 1.5rem; margin: 1rem 0; }
+  .curseurs label { margin: .4rem 0 .1rem; font-size: .85rem; }
+  .curseurs label span { color: #1a73e8; font-weight: 700; }
+  input[type=range] { width: 100%; }
+  .apercu { border: 1px solid #ddd; border-radius: 8px; background: #fafafa;
+            max-height: 70vh; overflow: auto; margin: 1rem 0; text-align: center; }
+  .apercu svg { display: block; margin: 0 auto; }
+  #status { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -133,11 +141,35 @@ FORM_BODY = """<div class="card">
 
 RESULT_BODY = """<div class="card">
   <h1>Résultat de la conversion</h1>
-  <p><strong>{{ report.source }}</strong> — {{ report.analysis.width }}×{{ report.analysis.height }} px,
+  <p id="stats"><strong>{{ report.source|basename }}</strong> — {{ report.analysis.width }}×{{ report.analysis.height }} px,
      mode {{ report.analysis.mode_used }}, seuillage {{ report.analysis.threshold_method }},
      {{ report.paths }} tracés (dont {{ report.closed_paths }} fermés, {{ report.circles }} cercles,
      {{ report.get('ellipses', 0) }} ellipses et {{ report.arcs }} arcs parfaits), {{ report.points }} points.</p>
-  <img class="preview" src="{{ url_for('download', job_id=job_id, filename=preview_name) }}" alt="Aperçu du tracé">
+  <div class="curseurs">
+    <div>
+      <label for="zoom">Zoom <span id="zoom_val">100</span> %</label>
+      <input type="range" id="zoom" min="30" max="400" step="10" value="100">
+    </div>
+    <div>
+      <label for="sw">Épaisseur du trait <span id="sw_val">{{ init_sw }}</span> px <em>(immédiat)</em></label>
+      <input type="range" id="sw" min="0.25" max="6" step="0.05" value="{{ init_sw }}">
+    </div>
+    <div>
+      <label for="tol">Tolérance de simplification <span id="tol_val">{{ init_tol }}</span> px</label>
+      <input type="range" id="tol" min="0.45" max="3" step="0.05" value="{{ init_tol }}">
+    </div>
+    <div>
+      <label for="gap">Raccord des extrémités <span id="gap_val">{{ init_gap }}</span> px (0 = pas de fermeture)</label>
+      <input type="range" id="gap" min="0" max="10" step="0.5" value="{{ init_gap }}">
+    </div>
+  </div>
+  <div>
+    <label for="live_colors">Couleurs à tracer</label>
+    <input type="text" id="live_colors" value="{{ init_colors }}" placeholder="ex : rouge, jaune — ou 'toutes' (vide = noir et blanc)">
+  </div>
+  <p style="font-size:.85rem;color:#666">Zoom et épaisseur : effet immédiat. Tolérance, raccord et couleurs :
+     recalcul automatique de l'aperçu — état : <span id="status">prêt</span></p>
+  <div id="apercu" class="apercu">{{ svg_content|safe }}</div>
   <table>
     <tr><th>Contraste (écart-type)</th><td>{{ report.analysis.contrast_std }}</td></tr>
     <tr><th>Bruit estimé</th><td>{{ report.analysis.noise_sigma }}</td></tr>
@@ -147,8 +179,96 @@ RESULT_BODY = """<div class="card">
   <a class="btn" href="{{ url_for('download', job_id=job_id, filename=svg_name, dl=1) }}">Télécharger le SVG</a>
   <a class="btn" href="{{ url_for('download', job_id=job_id, filename=dxf_name, dl=1) }}">Télécharger le DXF</a>
   <a class="btn secondary" href="{{ url_for('download', job_id=job_id, filename=report_name, dl=1) }}">Rapport JSON</a>
+  <p style="font-size:.85rem;color:#666">Les fichiers téléchargés correspondent à la conversion initiale.
+     Après ajustement des curseurs, régénérez-les :</p>
+  <button type="button" id="regen">Régénérer les fichiers avec ces réglages</button>
   <br><a class="back" href="{{ url_for('index') }}">← Convertir une autre image</a>
-</div>"""
+</div>
+<script>
+(function () {
+  var apercu = document.getElementById('apercu');
+  var svg0 = apercu.querySelector('svg');
+  var natW = svg0 ? parseFloat(svg0.getAttribute('width')) || 800 : 800;
+  var gen = 0, timer = null;
+  var base = {{ url_for('api_preview', job_id=job_id)|tojson }};
+
+  function applyZoom() {
+    var z = document.getElementById('zoom').value;
+    var s = apercu.querySelector('svg');
+    if (s) { s.style.width = (natW * z / 100) + 'px'; s.style.height = 'auto'; }
+    document.getElementById('zoom_val').textContent = z;
+  }
+  function applyStroke() {
+    var v = document.getElementById('sw').value;
+    var s = apercu.querySelector('svg');
+    if (s) {
+      var g = s.querySelector('g');
+      if (g) g.setAttribute('stroke-width', v);
+    }
+    document.getElementById('sw_val').textContent = v;
+  }
+  function schedule() {
+    document.getElementById('status').textContent = 'recalcul…';
+    clearTimeout(timer);
+    timer = setTimeout(recompute, 700);
+  }
+  async function recompute() {
+    var my = ++gen;
+    var q = new URLSearchParams({
+      tolerance: document.getElementById('tol').value,
+      gap: document.getElementById('gap').value,
+      colors: document.getElementById('live_colors').value || 'none'
+    });
+    try {
+      var r = await fetch(base + '?' + q.toString());
+      var d = await r.json();
+      if (my !== gen) return;
+      if (d.error) { document.getElementById('status').textContent = 'erreur : ' + d.error; return; }
+      apercu.innerHTML = d.svg;
+      applyZoom(); applyStroke();
+      document.getElementById('stats').innerHTML = '<strong>{{ report.source|basename }}</strong> — ' +
+        d.paths + ' tracés (dont ' + d.closed + ' fermés, ' + d.circles + ' cercles, ' +
+        d.ellipses + ' ellipses et ' + d.arcs + ' arcs parfaits), ' + d.points + ' points.';
+      document.getElementById('status').textContent = 'prêt';
+    } catch (e) {
+      if (my === gen) document.getElementById('status').textContent = 'erreur réseau';
+    }
+  }
+  document.getElementById('zoom').addEventListener('input', applyZoom);
+  document.getElementById('sw').addEventListener('input', applyStroke);
+  ['tol', 'gap'].forEach(function (id) {
+    document.getElementById(id).addEventListener('input', function () {
+      document.getElementById(id.replace('tol', 'tol_val').replace('gap', 'gap_val')).textContent =
+        document.getElementById(id).value;
+      schedule();
+    });
+  });
+  document.getElementById('live_colors').addEventListener('change', schedule);
+  document.getElementById('regen').addEventListener('click', async function () {
+    var b = this;
+    b.disabled = true; b.textContent = 'Régénération…';
+    try {
+      var r = await fetch({{ url_for('regenerate', job_id=job_id)|tojson }}, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          tolerance: document.getElementById('tol').value,
+          gap: document.getElementById('gap').value,
+          stroke_width: document.getElementById('sw').value,
+          colors: document.getElementById('live_colors').value || 'none'
+        })
+      });
+      if (r.ok) { location.reload(); return; }
+      var d = await r.json().catch(function () { return {}; });
+      alert('Régénération impossible : ' + (d.error || r.status));
+    } catch (e) {
+      alert('Erreur réseau');
+    }
+    b.disabled = false; b.textContent = 'Régénérer les fichiers avec ces réglages';
+  });
+  applyZoom(); applyStroke();
+})();
+</script>"""
 
 
 @app.template_filter("basename")
@@ -217,8 +337,7 @@ def convert():
     return redirect(url_for("result", job_id=job_id))
 
 
-@app.route("/result/<job_id>")
-def result(job_id: str):
+def _load_job(job_id: str):
     if not re.fullmatch(r"[0-9a-f]{32}", job_id):
         abort(404)
     job_dir = JOBS_DIR / job_id
@@ -226,15 +345,103 @@ def result(job_id: str):
     if not reports:
         abort(404)
     report = json.loads(reports[0].read_text(encoding="utf-8"))
+    src = Path(report["source"])
+    if not src.is_file():
+        abort(404)
+    return job_dir, report, src
+
+
+def _parse_float(value: str, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+def _colors_str(report: dict) -> str:
+    c = report.get("parameters", {}).get("colors", "none")
+    if isinstance(c, list):
+        return ", ".join(c)
+    return "" if c in ("none", None) else str(c)
+
+
+@app.route("/result/<job_id>")
+def result(job_id: str):
+    job_dir, report, _src = _load_job(job_id)
+    params = report.get("parameters", {})
+    w = report["analysis"]["width"]
+    h = report["analysis"]["height"]
+    if params.get("close_lines"):
+        gap0 = params.get("gap_px")
+        init_gap = gap0 if gap0 is not None else max(1.5, 0.004 * max(w, h))
+    else:
+        init_gap = 0.0
+    init_tol = min(3.0, max(0.45, params.get("tolerance_px", 0.8)))
+    svg_content = Path(report["outputs"]["svg"]).read_text(encoding="utf-8")
     return render_template_string(
         HEAD + RESULT_BODY + FOOT,
         job_id=job_id,
         report=report,
+        svg_content=svg_content,
+        init_sw=report["analysis"]["stroke_width_px"],
+        init_tol=round(init_tol, 2),
+        init_gap=round(init_gap, 2),
+        init_colors=_colors_str(report),
         svg_name=Path(report["outputs"]["svg"]).name,
         dxf_name=Path(report["outputs"]["dxf"]).name,
         preview_name=Path(report["outputs"]["preview"]).name,
-        report_name=reports[0].name,
+        report_name=sorted(job_dir.glob("*_report.json"))[0].name,
     )
+
+
+@app.route("/api/preview/<job_id>")
+def api_preview(job_id: str):
+    _job_dir, report, src = _load_job(job_id)
+    tol = _parse_float(request.args.get("tolerance", "0.8"), 0.8, 0.3, 4.0)
+    gap = _parse_float(request.args.get("gap", "0"), 0.0, 0.0, 20.0)
+    colors = request.args.get("colors", "none") or "none"
+    live = JOBS_DIR / job_id / "live"
+    try:
+        agent = ImageVectorAgent(quality="high", tolerance=tol,
+                                 close_lines=gap > 0, gap=gap if gap > 0 else None,
+                                 colors=colors)
+        rep = agent.run(src, live)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    svg = (live / (src.stem + ".svg")).read_text(encoding="utf-8")
+    return jsonify({"svg": svg, "paths": rep["paths"], "closed": rep["closed_paths"],
+                    "circles": rep["circles"], "arcs": rep["arcs"],
+                    "ellipses": rep["ellipses"], "points": rep["points"]})
+
+
+@app.route("/regenerate/<job_id>", methods=["POST"])
+def regenerate(job_id: str):
+    _job_dir, report, src = _load_job(job_id)
+    params = report.get("parameters", {})
+    body = request.get_json(silent=True) or {}
+    tol = _parse_float(body.get("tolerance", params.get("tolerance_px", 0.8)), 0.8, 0.3, 4.0)
+    gap = _parse_float(body.get("gap", "0"), 0.0, 0.0, 20.0)
+    sw = _parse_float(body.get("stroke_width", report["analysis"]["stroke_width_px"]),
+                      report["analysis"]["stroke_width_px"], 0.25, 6.0)
+    colors = body.get("colors", "none") or "none"
+    try:
+        agent = ImageVectorAgent(
+            mode=params.get("mode", "auto"),
+            tolerance=tol,
+            threshold=params.get("threshold", "auto"),
+            invert=bool(params.get("invert", False)),
+            unit=params.get("unit", "px"),
+            scale=params.get("scale", 1.0),
+            close_lines=gap > 0,
+            gap=gap if gap > 0 else None,
+            stroke_width=sw,
+            colors=colors,
+        )
+        agent.run(src, JOBS_DIR / job_id)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True})
 
 
 @app.route("/download/<job_id>/<path:filename>")

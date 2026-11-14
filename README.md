@@ -32,7 +32,15 @@ python webapp.py
 ```
 
 Ouvrez ensuite http://127.0.0.1:8000 dans un navigateur : chargez une image, choisissez
-les options, puis téléchargez le SVG et le DXF depuis la page de résultat (aperçu inclus).
+les options, puis téléchargez le SVG et le DXF depuis la page de résultat.
+
+La page de résultat affiche un **aperçu interactif en direct** avec curseurs :
+
+- **Zoom** et **épaisseur du trait** : effet immédiat (côté navigateur) ;
+- **Tolérance de simplification**, **raccord des extrémités** (0 = pas de fermeture)
+  et **couleurs à tracer** : l'aperçu est recalculé automatiquement (léger délai) ;
+- le bouton « Régénérer les fichiers avec ces réglages » réécrit le SVG et le DXF
+  téléchargeables avec les réglages courants.
 
 Options disponibles : mode d'extraction, qualité du tracé, unités et échelle du DXF,
 tracé clair sur fond sombre. Formats acceptés : JPEG, PNG, BMP, WebP, TIFF (32 Mo max).
