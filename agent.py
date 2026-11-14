@@ -217,6 +217,31 @@ def prune_and_simplify(paths: list, tolerance: float, scale: float) -> list[Vect
     return result
 
 
+def _drop_gradient_edges(edges: np.ndarray, smooth: np.ndarray) -> np.ndarray:
+    """Élimine les arêtes de simple texture de dégradé : une marche locale faible
+    (bandes d'un dégradé, bruit) est supprimée sauf si elle prolonge une arête
+    forte (hystérésis), de sorte que seuls les vrais contours subsistent."""
+    gx = cv2.Sobel(smooth, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(smooth, cv2.CV_64F, 0, 1, ksize=3)
+    gm = np.hypot(gx, gy)
+    ux = gx / np.maximum(gm, 1e-6)
+    uy = gy / np.maximum(gm, 1e-6)
+    h, w = smooth.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+
+    def sample(off: float) -> np.ndarray:
+        sx = np.clip(np.round(xx + ux * off).astype(int), 0, w - 1)
+        sy = np.clip(np.round(yy + uy * off).astype(int), 0, h - 1)
+        return smooth[sy, sx].astype(np.float64)
+
+    step = np.abs(sample(2) - sample(-2))
+    ep = edges > 0
+    strong = (ep & (step >= 60.0)).astype(np.uint8)
+    weak = ep & (step >= 30.0)
+    near_strong = cv2.dilate(strong, np.ones((3, 3), np.uint8), iterations=2) > 0
+    return ((strong > 0) | (weak & near_strong)).astype(np.uint8) * 255
+
+
 def extract_edges(gray: np.ndarray, tolerance: float, scale: float) -> list[VectorPath]:
     smooth = cv2.bilateralFilter(gray, 7, 40, 40)
     med = float(np.median(smooth))
@@ -224,6 +249,7 @@ def extract_edges(gray: np.ndarray, tolerance: float, scale: float) -> list[Vect
     hi = int(max(45.0, min(230.0, med * 1.20)))
     edges = cv2.Canny(smooth, lo, hi)
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+    edges = _drop_gradient_edges(edges, smooth)
     skel = skeletonize(edges > 0).astype(np.uint8) * 255
     return prune_and_simplify(trace_skeleton(skel), tolerance, scale)
 
@@ -1008,6 +1034,39 @@ def strip_points_near_circles(paths: list[VectorPath], circles: list[VectorPath]
     return out
 
 
+def remove_ring_shading(paths: list[VectorPath], circles: list[VectorPath], band: float, tol: float) -> list[VectorPath]:
+    """Supprime le long des cercles parfaits les traits redondants : doublons (arc ou
+    polyligne qui recopie un cercle deja detecte) et traits d'ombrage bosselles qui
+    longent l'anneau sans former de forme propre. Un fragment circulaire bien fitte
+    mais a un rayon/centre distinct est conserve."""
+    if not circles:
+        return paths
+    out = []
+    for p in paths:
+        if p.kind in ("circle", "ellipse"):
+            out.append(p)
+            continue
+        pts = np.array(curve_points(p), dtype=np.float64)
+        drop = False
+        for c in circles:
+            r = c.radius
+            W = max(band + 4.0, 0.06 * r)
+            gaps = np.abs(np.hypot(pts[:, 0] - c.center[0], pts[:, 1] - c.center[1]) - r)
+            if float((gaps <= W).mean()) < 0.7:
+                continue
+            fit = circle_fit(pts)
+            same = (fit is not None
+                    and math.hypot(fit[0] - c.center[0], fit[1] - c.center[1]) < 10
+                    and abs(fit[2] - r) < max(band, 0.03 * r))
+            wobbly = fit is None or fit[3] > max(2.0 * tol, 0.02 * r)
+            if same or wobbly:
+                drop = True
+                break
+        if not drop:
+            out.append(p)
+    return out
+
+
 def curve_points(p: VectorPath, step_deg: float = 5.0) -> list:
     if p.kind == "circle":
         n = max(24, int(360 / step_deg))
@@ -1295,6 +1354,9 @@ class ImageVectorAgent:
                               + new_circles + new_ellipses)
                 band = max(2.5, 0.75 * stroke_up / scale)
                 paths = strip_points_near_circles(paths, all_curves, band) + new_circles + new_ellipses
+                paths = remove_ring_shading(paths,
+                                            [c for c in all_curves if c.kind == "circle"],
+                                            band, tol / scale)
         n_circles = sum(1 for p in paths if p.kind == "circle")
         n_arcs = sum(1 for p in paths if p.kind == "arc")
         n_ellipses = sum(1 for p in paths if p.kind == "ellipse")
