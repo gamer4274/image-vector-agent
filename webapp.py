@@ -113,6 +113,10 @@ FORM_BODY = """<div class="card">
       <input type="checkbox" name="curves" value="1" style="width:auto" checked>
       Cercles et arcs parfaits (CAO)
     </label>
+    <div>
+      <label for="colors">Couleurs à tracer</label>
+      <input type="text" id="colors" name="colors" placeholder="ex : rouge, jaune — ou 'toutes' (vide = noir et blanc)">
+    </div>
     <div class="row">
       <div>
         <label for="stroke_width">Épaisseur du trait SVG (px)</label>
@@ -204,6 +208,7 @@ def convert():
         closed_only=False,
         stroke_width=stroke_width,
         fit_curves=request.form.get("curves") == "1",
+        colors=request.form.get("colors", "none"),
     )
     try:
         report = agent.run(src, job_dir)

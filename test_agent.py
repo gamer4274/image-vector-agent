@@ -18,6 +18,7 @@ import numpy as np
 
 from agent import (
     QUALITY_TOLERANCE,
+    COLOR_NAMES,
     _drop_gradient_edges,
     ImageVectorAgent,
     VectorPath,
@@ -28,8 +29,10 @@ from agent import (
     detect_curves,
     detect_ellipses,
     detect_rings,
+    dominant_color,
     load_image,
     preprocess,
+    quantize_colors,
     remove_ring_shading,
     remove_specks,
     ring_scores,
@@ -498,6 +501,83 @@ class TestPipelineComplet(unittest.TestCase):
             doc = ezdxf.readfile(report["outputs"]["dxf"])
             self.assertGreaterEqual(
                 sum(1 for e in doc.modelspace() if e.dxftype() == "ARC"), 1)
+
+
+class TestCouleurs(unittest.TestCase):
+    def test_quantize_colors_six_zones(self):
+        img = np.zeros((300, 600, 3), dtype=np.uint8)
+        zones = {
+            "rouge": (60, 60, 220),
+            "jaune": (50, 220, 240),
+            "vert": (60, 200, 60),
+            "bleu": (220, 80, 40),
+            "blanc": (245, 245, 245),
+            "noir": (20, 20, 20),
+        }
+        for k, name in enumerate(COLOR_NAMES):
+            col = k % 3
+            row = k // 3
+            img[row * 150:(row + 1) * 150, col * 200:(col + 1) * 200] = zones[name]
+        labels = quantize_colors(img)
+        for k, name in enumerate(COLOR_NAMES):
+            col = k % 3
+            row = k // 3
+            zone = labels[row * 150 + 40:(row + 1) * 150 - 40, col * 200 + 40:(col + 1) * 200 - 40]
+            self.assertEqual(int(np.bincount(zone.ravel(), minlength=6).argmax()), k,
+                             f"zone {name} mal classee")
+
+    def test_dominant_color_vote(self):
+        labels = np.zeros((100, 100), dtype=np.uint8)
+        labels[:, 50:] = 2
+        self.assertEqual(dominant_color(labels, [(10, 10), (20, 30)]), "bleu")
+        self.assertEqual(dominant_color(labels, [(60, 10), (70, 30), (80, 20)]), "rouge")
+        self.assertEqual(dominant_color(labels, []), "")
+
+    def test_run_couleurs_bout_en_bout(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "couleur.jpg"
+            outdir = Path(d) / "out"
+            img = make_canvas(800)
+            cv2.rectangle(img, (100, 100), (300, 300), (60, 60, 220), -1)
+            cv2.circle(img, (550, 400), 120, (50, 220, 240), -1)
+            cv2.imwrite(str(src), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            agent = ImageVectorAgent(quality="high", colors="rouge,jaune")
+            report = agent.run(src, outdir)
+            self.assertGreaterEqual(report["circles"], 1)
+            self.assertGreater(report["paths"], 0)
+            self.assertTrue(any(v > 0 for v in report["colors"].values()))
+            svg = Path(report["outputs"]["svg"]).read_text(encoding="utf-8")
+            self.assertIn("#d62728", svg)
+            self.assertIn("#e8b923", svg)
+            self.assertIn('#fafafa', svg)
+            doc = ezdxf.readfile(report["outputs"]["dxf"])
+            layers = {l.dxf.name for l in doc.layers}
+            self.assertIn("COL_ROUGE", layers)
+            self.assertIn("COL_JAUNE", layers)
+
+    def test_selection_une_seule_couleur(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "couleur.jpg"
+            outdir = Path(d) / "out"
+            img = make_canvas(800)
+            cv2.rectangle(img, (100, 100), (300, 300), (60, 60, 220), -1)
+            cv2.circle(img, (550, 400), 120, (50, 220, 240), -1)
+            cv2.imwrite(str(src), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            agent = ImageVectorAgent(quality="high", colors="rouge")
+            report = agent.run(src, outdir)
+            svg = Path(report["outputs"]["svg"]).read_text(encoding="utf-8")
+            self.assertIn("#d62728", svg)
+            self.assertNotIn("#e8b923", svg)
+
+    def test_couleur_inconnue_erreur(self):
+        with self.assertRaises(ValueError):
+            ImageVectorAgent(colors="pourpre")
+        with self.assertRaises(ValueError):
+            ImageVectorAgent(colors="rouge,pourpre")
+        self.assertIsNone(ImageVectorAgent._parse_colors("none"))
+        self.assertIsNone(ImageVectorAgent._parse_colors(""))
+        self.assertEqual(ImageVectorAgent._parse_colors("toutes"), list(COLOR_NAMES))
+        self.assertEqual(ImageVectorAgent._parse_colors("rouge; jaune"), ["rouge", "jaune"])
 
 
 if __name__ == "__main__":
